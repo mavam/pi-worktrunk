@@ -1,0 +1,53 @@
+name: Release and Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      intro:
+        description: |
+          Intro of the release
+
+          The intro should be 1-2 sentences long, must be written in active
+          voice, and should clearly communicate the theme of the release to the
+          user. Use full sentences and avoid abbreviations.
+        required: true
+        type: string
+      title:
+        description: |
+          User-facing release title (auto-generated if omitted)
+        required: false
+        type: string
+
+jobs:
+  release:
+    name: Create GitHub release
+    uses: tenzir/ship/.github/workflows/release.yaml@main
+    permissions:
+      contents: write
+    with:
+      intro: ${{ inputs.intro }}
+      title: ${{ inputs.title }}
+
+  publish:
+    name: Publish package to npm
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ needs.release.outputs.version }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - name: Publish to npm
+        run: npm publish

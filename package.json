@@ -1,0 +1,39 @@
+{
+  "name": "pi-worktrunk",
+  "version": "0.1.0",
+  "description": "A Worktrunk extension for pi",
+  "type": "module",
+  "files": [
+    "worktrunk.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "worktrunk",
+    "git-worktree",
+    "status"
+  ],
+  "author": "Matthias Vallentin",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mavam/pi-worktrunk.git"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "test": "node --test --experimental-strip-types *.test.ts"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "pi": {
+    "extensions": [
+      "./worktrunk.ts"
+    ]
+  }
+}
