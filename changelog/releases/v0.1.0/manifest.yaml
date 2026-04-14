@@ -1,0 +1,8 @@
+created: 2026-04-14
+title: Worktrunk status markers for pi sessions
+intro: >-
+  This release adds Worktrunk status markers for pi sessions so `wt list` shows whether
+  pi is actively working or waiting for input. It helps you manage multiple worktrees
+  by making in-progress and idle branches visible at a glance.
+source:
+  mode: sync-stable-queue
