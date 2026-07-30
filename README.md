@@ -12,8 +12,7 @@ pi install npm:pi-worktrunk
 
 ## 📋 Requirements
 
-- Install [`wt`](https://worktrunk.dev/) 0.70 or later and make it available on
-  your `PATH`.
+- Install [`wt`](https://worktrunk.dev/) and make it available on your `PATH`.
 - Run pi from a Git repository that Worktrunk can manage.
 
 ## ✨ What it does
@@ -80,9 +79,9 @@ The extension registers one `worktree` tool with these actions:
 | `path` | Optional `target` | Resolve a worktree path without changing directories. |
 | `settings` | None | Inspect the active Worktrunk configuration. |
 
-The extension requests Worktrunk's JSON schema 2 explicitly and targets
-Worktrunk 0.70 or later. Tool output is limited to 2,000 lines or 50 KB. The
-extension saves larger output to a temporary file and returns its path.
+The extension requests Worktrunk's JSON schema 2 explicitly. Tool output is
+limited to 2,000 lines or 50 KB. The extension saves larger output to a
+temporary file and returns its path.
 
 ## 🛡️ Safety
 
