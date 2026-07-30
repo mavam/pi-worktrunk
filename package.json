@@ -1,7 +1,7 @@
 {
   "name": "pi-worktrunk",
   "version": "0.1.0",
-  "description": "A Worktrunk extension for pi",
+  "description": "Worktrunk status, commands, and agent tools for pi",
   "type": "module",
   "files": [
     "worktrunk.ts",
@@ -14,7 +14,9 @@
     "pi-extension",
     "worktrunk",
     "git-worktree",
-    "status"
+    "status",
+    "commands",
+    "agent-tools"
   ],
   "author": "Matthias Vallentin",
   "license": "MIT",
@@ -24,6 +26,10 @@
   },
   "engines": {
     "node": ">=24.0.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
   },
   "scripts": {
     "test": "node --test --experimental-strip-types *.test.ts"

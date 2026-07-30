@@ -1,5 +1,5 @@
 id: pi-worktrunk
 name: Pi Worktrunk
 description: >-
-  A Worktrunk status marker extension for pi.
+  Worktrunk status markers, interactive commands, and agent tools for pi.
 repository: mavam/pi-worktrunk
