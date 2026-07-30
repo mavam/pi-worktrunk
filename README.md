@@ -107,21 +107,6 @@ Use Worktrunk's user and project configuration files:
 Run `wt config create` or see the
 [Worktrunk configuration reference](https://worktrunk.dev/config/).
 
-## 🧪 Development
-
-Run the tests with Node.js 24 or later:
-
-```sh
-npm install
-npm test
-```
-
-## 🧹 Uninstall
-
-```sh
-pi remove npm:pi-worktrunk
-```
-
 ## 📄 License
 
 [MIT](LICENSE)
