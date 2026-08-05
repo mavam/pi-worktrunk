@@ -1,10 +1,11 @@
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 
 import {
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
+  SessionManager,
   formatSize,
   truncateHead,
   type ExtensionAPI,
@@ -41,6 +42,18 @@ type RunWtOptions = {
 };
 
 type RunWt = (args: string[], options?: RunWtOptions) => Promise<WtResult>;
+
+type SessionTarget = {
+  branch: string | null;
+  path: string;
+};
+
+type ForkSession = (sourceSession: string, targetCwd: string) => string;
+
+type ContinueSession = (
+  ctx: ExtensionCommandContext,
+  target: SessionTarget,
+) => Promise<boolean>;
 
 type Relation = {
   ahead?: number;
@@ -119,6 +132,122 @@ class WorktrunkError extends Error {
     this.name = "WorktrunkError";
   }
 }
+
+export function createSessionContinuator(forkSession: ForkSession) {
+  return async function continueSession(
+    ctx: ExtensionCommandContext,
+    target: SessionTarget,
+  ): Promise<boolean> {
+    const sourceCwd = resolve(ctx.cwd);
+    const targetCwd = resolve(ctx.cwd, target.path);
+    if (sourceCwd === targetCwd) {
+      throw new WorktrunkError(
+        "Pi is already running in the selected worktree.",
+      );
+    }
+    if (!ctx.hasUI) {
+      throw new WorktrunkError(
+        "Continuing a session in another worktree requires interactive or RPC mode.",
+      );
+    }
+
+    const sourceSession = ctx.sessionManager.getSessionFile();
+    if (!sourceSession) {
+      throw new WorktrunkError(
+        "Cannot continue an ephemeral session with no session file.",
+      );
+    }
+
+    await ctx.waitForIdle();
+    const confirmed = await ctx.ui.confirm(
+      "Continue session in worktree?",
+      [
+        "Pi will create a new session copy and switch this process to it.",
+        "The current session remains available.",
+        "",
+        `Branch: ${target.branch ?? "(detached)"}`,
+        `From:   ${sourceCwd}`,
+        `To:     ${targetCwd}`,
+      ].join("\n"),
+    );
+    if (!confirmed) {
+      ctx.ui.notify(
+        `Session continuation cancelled.\nWorktree: ${targetCwd}\nPi remains in ${sourceCwd}.`,
+        "info",
+      );
+      return false;
+    }
+
+    let destinationSession: string;
+    try {
+      destinationSession = forkSession(sourceSession, targetCwd);
+    } catch (error) {
+      throw new WorktrunkError(
+        `Could not create the session continuation: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+
+    const transitionMessage = [
+      "This Pi session continues in another Worktrunk worktree.",
+      `Previous working directory: ${sourceCwd}`,
+      `Current working directory: ${targetCwd}`,
+      "Historical messages keep their original text, so absolute paths in earlier messages may still refer to the previous worktree. Resolve project-relative paths from the current working directory.",
+    ].join("\n");
+
+    const result = await ctx.switchSession(destinationSession, {
+      withSession: async (nextCtx) => {
+        try {
+          await nextCtx.sendMessage({
+            customType: "pi-worktrunk-session-continuation",
+            content: transitionMessage,
+            display: true,
+            details: {
+              branch: target.branch,
+              sourceCwd,
+              targetCwd,
+              sourceSession,
+              destinationSession,
+            },
+          });
+        } catch (error) {
+          nextCtx.ui.notify(
+            `The session switched, but Pi could not record the worktree transition: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+            "warning",
+          );
+        }
+        nextCtx.ui.notify(
+          `Continued the session in ${target.branch ?? targetCwd}.\nThe source session remains available.`,
+          "info",
+        );
+      },
+    });
+    if (result.cancelled) {
+      ctx.ui.notify(
+        `Session switching was cancelled.\nContinuation: ${destinationSession}\nPi remains in ${sourceCwd}.`,
+        "warning",
+      );
+      return false;
+    }
+    return true;
+  };
+}
+
+// pi-session-move demonstrated activating a target-cwd session copy with
+// ctx.switchSession(): https://github.com/ProbabilityEngineer/pi-session-move
+const continueSessionInWorktree = createSessionContinuator(
+  (sourceSession, targetCwd) => {
+    const session = SessionManager.forkFrom(sourceSession, targetCwd);
+    const destinationSession = session.getSessionFile();
+    if (!destinationSession) {
+      throw new Error("Pi did not create a persisted session copy.");
+    }
+    return destinationSession;
+  },
+);
 
 function parseJson<T>(output: string, command: string): T {
   try {
@@ -333,17 +462,19 @@ const HELP_TEXT = `
 /worktree - Manage worktrees with Worktrunk
 
 Commands:
-  /worktree list                 Select and inspect a worktree
-  /worktree create <branch>      Create a branch and worktree
-  /worktree remove [target]      Remove a worktree and any safe-to-delete branch
-  /worktree status               Show the current worktree
-  /worktree cd [target]          Show a worktree path
-  /worktree settings             Show the active Worktrunk configuration
+  /worktree list                           Select and inspect a worktree
+  /worktree create <branch> [--continue]   Create a worktree and optionally continue there
+  /worktree continue [target]              Continue this Pi session in a worktree
+  /worktree remove [target]                Remove a worktree and any safe-to-delete branch
+  /worktree status                         Show the current worktree
+  /worktree cd [target]                    Show a worktree path
+  /worktree settings                       Show the active Worktrunk configuration
 `.trim();
 
 const SUBCOMMANDS = [
   "list",
   "create",
+  "continue",
   "remove",
   "status",
   "cd",
@@ -372,6 +503,25 @@ function requireBranch(args: string): string {
     throw new WorktrunkError("Usage: /worktree create <branch>");
   }
   return args;
+}
+
+function parseCreateArgs(args: string): {
+  branch: string;
+  continueSession: boolean;
+} {
+  const values = args.trim().split(/\s+/).filter(Boolean);
+  const continueFlags = values.filter((value) => value === "--continue");
+  const positional = values.filter((value) => value !== "--continue");
+  if (
+    continueFlags.length > 1 ||
+    positional.length !== 1 ||
+    positional[0].startsWith("-")
+  ) {
+    throw new WorktrunkError(
+      "Usage: /worktree create <branch> [--continue]",
+    );
+  }
+  return { branch: positional[0], continueSession: continueFlags.length === 1 };
 }
 
 async function chooseWorktree(
@@ -413,12 +563,67 @@ async function commandCreate(
   args: string,
   ctx: ExtensionCommandContext,
   client: WorktrunkClient,
+  continueSession: ContinueSession,
 ): Promise<void> {
-  const created = await client.create(ctx.cwd, requireBranch(args));
+  const input = parseCreateArgs(args);
+  const created = await client.create(ctx.cwd, input.branch);
+  if (input.continueSession) {
+    try {
+      await continueSession(ctx, created);
+    } catch (error) {
+      throw new WorktrunkError(
+        `Created ${created.branch} at ${created.path}, but could not continue the Pi session: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    return;
+  }
   ctx.ui.notify(
     `Created ${created.branch}.\nPath: ${created.path}\nPi remains in ${ctx.cwd}.`,
     "info",
   );
+}
+
+async function commandContinue(
+  args: string,
+  ctx: ExtensionCommandContext,
+  client: WorktrunkClient,
+  continueSession: ContinueSession,
+): Promise<void> {
+  const worktrees = await client.list(ctx.cwd);
+  const candidates = worktrees.filter(
+    (item) => item.worktree?.path && !item.worktree.current,
+  );
+  const target = args
+    ? resolveWorktree(worktrees, args)
+    : ctx.hasUI
+      ? await chooseWorktree(
+          ctx,
+          "Select a worktree in which to continue the session",
+          candidates,
+        )
+      : undefined;
+
+  if (!target) {
+    if (!args && !ctx.hasUI) {
+      throw new WorktrunkError(
+        "Usage: /worktree continue <branch-or-path>",
+      );
+    }
+    if (args) throw new WorktrunkError(`Worktree not found: ${args}`);
+    if (candidates.length === 0) {
+      ctx.ui.notify("No other worktrees found.", "info");
+    }
+    return;
+  }
+  if (!target.worktree?.path) {
+    throw new WorktrunkError("The worktree has no path.");
+  }
+  await continueSession(ctx, {
+    branch: target.branch,
+    path: target.worktree.path,
+  });
 }
 
 async function commandRemove(
@@ -516,6 +721,7 @@ export async function handleWorktreeCommand(
   input: string,
   ctx: ExtensionCommandContext,
   client: WorktrunkClient,
+  continueSession: ContinueSession = continueSessionInWorktree,
 ): Promise<void> {
   const { command: rawCommand, args } = splitCommand(input);
   const command =
@@ -536,7 +742,10 @@ export async function handleWorktreeCommand(
         await commandList(args, ctx, client);
         return;
       case "create":
-        await commandCreate(args, ctx, client);
+        await commandCreate(args, ctx, client, continueSession);
+        return;
+      case "continue":
+        await commandContinue(args, ctx, client, continueSession);
         return;
       case "remove":
         await commandRemove(args, ctx, client);
@@ -641,7 +850,7 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: [
       "Use the worktree tool when the user asks to inspect or manage Worktrunk worktrees.",
       "Only use the worktree remove action when the user explicitly asks to remove a worktree.",
-      "The worktree tool returns target paths but cannot change Pi's current working directory.",
+      "The worktree tool returns target paths but cannot switch Pi's active session; use /worktree continue for an interactive session transition.",
     ],
     parameters: Type.Object(
       {

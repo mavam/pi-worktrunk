@@ -1,8 +1,8 @@
 # 🚦 pi-worktrunk
 
 A [pi](https://github.com/earendil-works/pi-mono/tree/main/packages/coding-agent)
-extension that brings Worktrunk status markers, interactive commands, and agent
-worktree tools under one roof.
+extension that brings Worktrunk status markers, interactive commands, session
+continuation, and agent worktree tools under one roof.
 
 ## 🚀 Installation
 
@@ -20,6 +20,7 @@ pi install npm:pi-worktrunk
 - Adds tiny traffic lights to `wt list` so you can see whether pi is working or
   waiting for you
 - Gives you a `/worktree` command for interactive worktree management
+- Continues the current pi session in another worktree when you request it
 - Gives the model the same Worktrunk-backed controls through one `worktree` tool
 - Keeps Worktrunk as the source of truth, with no second layer of worktree magic
 
@@ -51,6 +52,8 @@ Use `/worktree` to show the command reference.
 | --- | --- |
 | `/worktree list` | Select and inspect a worktree from `wt list --format=json`. |
 | `/worktree create <branch>` | Create a branch and worktree with `wt switch --create --no-cd`. |
+| `/worktree create <branch> --continue` | Create a worktree and continue the current pi session there. |
+| `/worktree continue [target]` | Select or name a worktree in which to continue the current pi session. |
 | `/worktree remove [target]` | Remove a selected or named worktree; Worktrunk deletes its branch when safe. |
 | `/worktree status` | Show the current worktree and its local and remote state. |
 | `/worktree cd [target]` | Show the path for a branch, path, directory name, or the current worktree. |
@@ -59,12 +62,20 @@ Use `/worktree` to show the command reference.
 The command also supports `ls`, `rm`, and `config` as aliases for `list`,
 `remove`, and `settings`.
 
-### 📍 Working-directory behavior
+### 📍 Continue a session
 
-Pi doesn't expose an extension API for changing the active session's working
-directory. `/worktree create`, `/worktree list`, and `/worktree cd` therefore
-return the target path without changing the current pi session. Start another pi
-session in that path when you want to work there.
+Use `/worktree continue [target]` to continue the current session in an existing
+worktree. Add `--continue` to `/worktree create <branch>` to create the worktree
+and continue there in one operation.
+
+Before switching, the extension shows the source and target directories and asks
+for confirmation. It then creates a new pi session in the target worktree, links
+it to the source session through Pi's parent-session metadata, and switches the
+current pi process to the new session. The source session remains available.
+
+The copied history keeps its original text. A visible transition message tells
+the model about the new working directory and warns that historical absolute
+paths can still refer to the source worktree.
 
 ## 🧰 Agent tool
 
@@ -83,6 +94,9 @@ The extension requests Worktrunk's JSON schema 2 explicitly. Tool output is
 limited to 2,000 lines or 50 KB. The extension saves larger output to a
 temporary file and returns its path.
 
+The agent tool can create and resolve worktrees, but it can't switch the active
+pi session. Use `/worktree continue` for that user-confirmed transition.
+
 ## 🛡️ Safety
 
 The extension delegates lifecycle decisions to Worktrunk:
@@ -95,6 +109,17 @@ The extension delegates lifecycle decisions to Worktrunk:
 - Project hooks retain Worktrunk's approval gate. If a command reports that a
   hook needs approval, run `wt config approvals add` in a terminal, review the
   commands, and retry.
+- Session continuation requires confirmation, preserves the source session, and
+  doesn't rewrite historical messages.
+
+## 🔗 Prior art
+
+The session continuation flow was inspired by
+[`pi-session-move`](https://github.com/ProbabilityEngineer/pi-session-move),
+which demonstrated switching a live pi process into a session copy for another
+working directory. This extension uses Pi's `SessionManager.forkFrom()` API for
+a narrower Worktrunk-specific flow. It doesn't vendor `pi-session-move` or
+rewrite session history.
 
 ## ⚙️ Configuration
 

@@ -1,7 +1,7 @@
 {
   "name": "pi-worktrunk",
   "version": "0.1.0",
-  "description": "Worktrunk status, commands, and agent tools for pi",
+  "description": "Worktrunk status, session continuation, commands, and agent tools for pi",
   "type": "module",
   "files": [
     "worktrunk.ts",
@@ -16,7 +16,8 @@
     "git-worktree",
     "status",
     "commands",
-    "agent-tools"
+    "agent-tools",
+    "session-continuation"
   ],
   "author": "Matthias Vallentin",
   "license": "MIT",
