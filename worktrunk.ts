@@ -1,3 +1,4 @@
+import { existsSync, statSync, writeFileSync } from "node:fs";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
@@ -10,6 +11,8 @@ import {
   truncateHead,
   type ExtensionAPI,
   type ExtensionCommandContext,
+  type SessionEntry,
+  type SessionHeader,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
@@ -48,7 +51,21 @@ type SessionTarget = {
   path: string;
 };
 
-type ForkSession = (sourceSession: string, targetCwd: string) => string;
+export type SessionSnapshot = {
+  header: SessionHeader;
+  entries: SessionEntry[];
+};
+
+type SessionFork = {
+  destinationSession: string;
+  sourceSnapshot?: SessionSnapshot;
+};
+
+type ForkSession = (
+  sourceSession: string,
+  targetCwd: string,
+  snapshot: SessionSnapshot,
+) => string | SessionFork;
 
 type ContinueSession = (
   ctx: ExtensionCommandContext,
@@ -133,6 +150,62 @@ class WorktrunkError extends Error {
   }
 }
 
+function serializeSession(snapshot: SessionSnapshot): string {
+  return `${[snapshot.header, ...snapshot.entries]
+    .map((entry) => JSON.stringify(entry))
+    .join("\n")}\n`;
+}
+
+function sessionFileIsUnwritten(path: string): boolean {
+  return !existsSync(path) || statSync(path).size === 0;
+}
+
+export function materializeSessionSnapshot(
+  path: string,
+  snapshot: SessionSnapshot,
+): void {
+  if (!sessionFileIsUnwritten(path)) return;
+  writeFileSync(path, serializeSession(snapshot), {
+    encoding: "utf8",
+    flag: existsSync(path) ? "w" : "wx",
+  });
+}
+
+export function forkSessionFromSnapshot(
+  sourceSession: string,
+  targetCwd: string,
+  snapshot: SessionSnapshot,
+  targetSessionDir?: string,
+): SessionFork {
+  if (!sessionFileIsUnwritten(sourceSession)) {
+    const session = SessionManager.forkFrom(
+      sourceSession,
+      targetCwd,
+      targetSessionDir,
+    );
+    const destinationSession = session.getSessionFile();
+    if (!destinationSession) {
+      throw new Error("Pi did not create a persisted session copy.");
+    }
+    return { destinationSession };
+  }
+
+  const session = SessionManager.create(targetCwd, targetSessionDir, {
+    parentSession: sourceSession,
+  });
+  const destinationSession = session.getSessionFile();
+  const destinationHeader = session.getHeader();
+  if (!destinationSession || !destinationHeader) {
+    throw new Error("Pi did not create a persisted session copy.");
+  }
+  writeFileSync(
+    destinationSession,
+    serializeSession({ header: destinationHeader, entries: snapshot.entries }),
+    { encoding: "utf8", flag: "wx" },
+  );
+  return { destinationSession, sourceSnapshot: snapshot };
+}
+
 export function createSessionContinuator(forkSession: ForkSession) {
   return async function continueSession(
     ctx: ExtensionCommandContext,
@@ -160,14 +233,12 @@ export function createSessionContinuator(forkSession: ForkSession) {
 
     await ctx.waitForIdle();
     const confirmed = await ctx.ui.confirm(
-      "Continue session in worktree?",
+      `↪ Continue in ${target.branch ?? "selected worktree"}?`,
       [
-        "Pi will create a new session copy and switch this process to it.",
-        "The current session remains available.",
+        `From  ${sourceCwd}`,
+        `To    ${targetCwd}`,
         "",
-        `Branch: ${target.branch ?? "(detached)"}`,
-        `From:   ${sourceCwd}`,
-        `To:     ${targetCwd}`,
+        "Creates a session copy; the original stays available.",
       ].join("\n"),
     );
     if (!confirmed) {
@@ -179,8 +250,21 @@ export function createSessionContinuator(forkSession: ForkSession) {
     }
 
     let destinationSession: string;
+    let deferredSourceSnapshot: SessionSnapshot | undefined;
     try {
-      destinationSession = forkSession(sourceSession, targetCwd);
+      const sourceHeader = ctx.sessionManager.getHeader();
+      if (!sourceHeader) {
+        throw new Error("The source session has no header.");
+      }
+      const snapshot = {
+        header: structuredClone(sourceHeader),
+        entries: structuredClone(ctx.sessionManager.getEntries()),
+      };
+      const fork = forkSession(sourceSession, targetCwd, snapshot);
+      destinationSession =
+        typeof fork === "string" ? fork : fork.destinationSession;
+      deferredSourceSnapshot =
+        typeof fork === "string" ? undefined : fork.sourceSnapshot;
     } catch (error) {
       throw new WorktrunkError(
         `Could not create the session continuation: ${
@@ -190,17 +274,31 @@ export function createSessionContinuator(forkSession: ForkSession) {
     }
 
     const transitionMessage = [
-      "This Pi session continues in another Worktrunk worktree.",
-      `Previous working directory: ${sourceCwd}`,
-      `Current working directory: ${targetCwd}`,
-      "Historical messages keep their original text, so absolute paths in earlier messages may still refer to the previous worktree. Resolve project-relative paths from the current working directory.",
+      `From: ${sourceCwd}`,
+      `To:   ${targetCwd}`,
+      "",
+      "Use the new worktree for subsequent file operations; earlier paths may be stale.",
     ].join("\n");
 
     const result = await ctx.switchSession(destinationSession, {
       withSession: async (nextCtx) => {
+        let sourcePreserved = deferredSourceSnapshot === undefined;
+        if (deferredSourceSnapshot) {
+          try {
+            materializeSessionSnapshot(sourceSession, deferredSourceSnapshot);
+            sourcePreserved = true;
+          } catch (error) {
+            nextCtx.ui.notify(
+              `The session switched, but Pi could not preserve the fresh source session: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+              "warning",
+            );
+          }
+        }
         try {
           await nextCtx.sendMessage({
-            customType: "pi-worktrunk-session-continuation",
+            customType: "↪ Continued in worktree",
             content: transitionMessage,
             display: true,
             details: {
@@ -220,7 +318,9 @@ export function createSessionContinuator(forkSession: ForkSession) {
           );
         }
         nextCtx.ui.notify(
-          `Continued the session in ${target.branch ?? targetCwd}.\nThe source session remains available.`,
+          `Continued the session in ${target.branch ?? targetCwd}.${
+            sourcePreserved ? "\nThe source session remains available." : ""
+          }`,
           "info",
         );
       },
@@ -239,14 +339,7 @@ export function createSessionContinuator(forkSession: ForkSession) {
 // pi-session-move demonstrated activating a target-cwd session copy with
 // ctx.switchSession(): https://github.com/ProbabilityEngineer/pi-session-move
 const continueSessionInWorktree = createSessionContinuator(
-  (sourceSession, targetCwd) => {
-    const session = SessionManager.forkFrom(sourceSession, targetCwd);
-    const destinationSession = session.getSessionFile();
-    if (!destinationSession) {
-      throw new Error("Pi did not create a persisted session copy.");
-    }
-    return destinationSession;
-  },
+  forkSessionFromSnapshot,
 );
 
 function parseJson<T>(output: string, command: string): T {

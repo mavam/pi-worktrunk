@@ -1,11 +1,18 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
+
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 
 import extension, {
   MARKERS,
   createMarkerUpdater,
   createSessionContinuator,
   createWorktrunkClient,
+  forkSessionFromSnapshot,
   handleWorktreeCommand,
   markerArgs,
 } from "./worktrunk.ts";
@@ -263,6 +270,18 @@ test("session continuation forks, switches, and records the cwd transition", asy
         getSessionFile() {
           return "/sessions/source.jsonl";
         },
+        getHeader() {
+          return {
+            type: "session",
+            version: 3,
+            id: "source-id",
+            timestamp: "2026-08-09T17:29:46.150Z",
+            cwd: "/repo",
+          };
+        },
+        getEntries() {
+          return [];
+        },
       },
       async waitForIdle() {
         waited = true;
@@ -300,11 +319,14 @@ test("session continuation forks, switches, and records the cwd transition", asy
     ["/sessions/source.jsonl", "/repo.feature-auth"],
   ]);
   assert.deepEqual(switched, ["/sessions/continued.jsonl"]);
-  assert.match(confirmations[0][1], /The current session remains available/);
-  assert.match(confirmations[0][1], /From:\s+\/repo/);
-  assert.match(confirmations[0][1], /To:\s+\/repo\.feature-auth/);
-  assert.equal(messages[0].customType, "pi-worktrunk-session-continuation");
-  assert.match(messages[0].content, /Historical messages keep their original text/);
+  assert.equal(confirmations[0][0], "↪ Continue in feature/auth?");
+  assert.match(confirmations[0][1], /From\s+\/repo/);
+  assert.match(confirmations[0][1], /To\s+\/repo\.feature-auth/);
+  assert.match(confirmations[0][1], /the original stays available/);
+  assert.equal(messages[0].customType, "↪ Continued in worktree");
+  assert.match(messages[0].content, /^From:\s+\/repo$/m);
+  assert.match(messages[0].content, /^To:\s+\/repo\.feature-auth$/m);
+  assert.match(messages[0].content, /Use the new worktree for subsequent file operations/);
   assert.deepEqual(messages[0].details, {
     branch: "feature/auth",
     sourceCwd: "/repo",
@@ -317,6 +339,81 @@ test("session continuation forks, switches, and records the cwd transition", asy
       level === "info" && message.includes("Continued the session"),
     ),
   );
+});
+
+test("session continuation handles a source session that pi has not written yet", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-test-"));
+  try {
+    const sourceManager = SessionManager.create(
+      "/repo",
+      join(root, "source-sessions"),
+    );
+    sourceManager.appendSessionInfo("fresh session");
+    const sourceSession = sourceManager.getSessionFile();
+    assert.ok(sourceSession);
+    assert.equal(existsSync(sourceSession), false);
+
+    let destinationSession: string | undefined;
+    const continueSession = createSessionContinuator(
+      (source, target, snapshot) => {
+        const fork = forkSessionFromSnapshot(
+          source,
+          target,
+          snapshot,
+          join(root, "target-sessions"),
+        );
+        destinationSession = fork.destinationSession;
+        return fork;
+      },
+    );
+
+    const continued = await continueSession(
+      {
+        cwd: "/repo",
+        hasUI: true,
+        sessionManager: sourceManager,
+        async waitForIdle() {},
+        ui: {
+          async confirm() {
+            return true;
+          },
+          notify() {},
+        },
+        async switchSession(path: string, options: any) {
+          assert.equal(path, destinationSession);
+          await options.withSession({
+            async sendMessage() {},
+            ui: { notify() {} },
+          });
+          return { cancelled: false };
+        },
+      } as any,
+      { branch: "main", path: "/repo.main" },
+    );
+
+    assert.equal(continued, true);
+    assert.ok(destinationSession);
+    assert.equal(existsSync(sourceSession), true);
+    assert.equal(existsSync(destinationSession), true);
+
+    const sourceEntries = (await readFile(sourceSession, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    const destinationEntries = (await readFile(destinationSession, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+
+    assert.equal(sourceEntries[0].cwd, "/repo");
+    assert.equal(sourceEntries[1].type, "session_info");
+    assert.equal(sourceEntries[1].name, "fresh session");
+    assert.equal(destinationEntries[0].cwd, "/repo.main");
+    assert.equal(destinationEntries[0].parentSession, sourceSession);
+    assert.deepEqual(destinationEntries.slice(1), sourceEntries.slice(1));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("session continuation leaves Pi in place when confirmation is declined", async () => {
