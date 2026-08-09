@@ -58,13 +58,13 @@ export type SessionSnapshot = {
 
 type SessionFork = {
   destinationSession: string;
-  sourceSnapshot?: SessionSnapshot;
 };
 
 type ForkSession = (
   sourceSession: string,
   targetCwd: string,
-  snapshot: SessionSnapshot,
+  snapshot: SessionSnapshot | undefined,
+  targetSessionDir: string | undefined,
 ) => string | SessionFork;
 
 type ContinueSession = (
@@ -174,36 +174,26 @@ export function materializeSessionSnapshot(
 export function forkSessionFromSnapshot(
   sourceSession: string,
   targetCwd: string,
-  snapshot: SessionSnapshot,
+  snapshot?: SessionSnapshot,
   targetSessionDir?: string,
 ): SessionFork {
-  if (!sessionFileIsUnwritten(sourceSession)) {
-    const session = SessionManager.forkFrom(
-      sourceSession,
-      targetCwd,
-      targetSessionDir,
-    );
-    const destinationSession = session.getSessionFile();
-    if (!destinationSession) {
-      throw new Error("Pi did not create a persisted session copy.");
+  if (sessionFileIsUnwritten(sourceSession)) {
+    if (!snapshot) {
+      throw new Error("Cannot continue an unwritten session without a snapshot.");
     }
-    return { destinationSession };
+    materializeSessionSnapshot(sourceSession, snapshot);
   }
 
-  const session = SessionManager.create(targetCwd, targetSessionDir, {
-    parentSession: sourceSession,
-  });
+  const session = SessionManager.forkFrom(
+    sourceSession,
+    targetCwd,
+    targetSessionDir,
+  );
   const destinationSession = session.getSessionFile();
-  const destinationHeader = session.getHeader();
-  if (!destinationSession || !destinationHeader) {
+  if (!destinationSession) {
     throw new Error("Pi did not create a persisted session copy.");
   }
-  writeFileSync(
-    destinationSession,
-    serializeSession({ header: destinationHeader, entries: snapshot.entries }),
-    { encoding: "utf8", flag: "wx" },
-  );
-  return { destinationSession, sourceSnapshot: snapshot };
+  return { destinationSession };
 }
 
 export function createSessionContinuator(forkSession: ForkSession) {
@@ -250,21 +240,29 @@ export function createSessionContinuator(forkSession: ForkSession) {
     }
 
     let destinationSession: string;
-    let deferredSourceSnapshot: SessionSnapshot | undefined;
     try {
-      const sourceHeader = ctx.sessionManager.getHeader();
-      if (!sourceHeader) {
-        throw new Error("The source session has no header.");
+      let snapshot: SessionSnapshot | undefined;
+      if (sessionFileIsUnwritten(sourceSession)) {
+        const sourceHeader = ctx.sessionManager.getHeader();
+        if (!sourceHeader) {
+          throw new Error("The source session has no header.");
+        }
+        snapshot = {
+          header: structuredClone(sourceHeader),
+          entries: structuredClone(ctx.sessionManager.getEntries()),
+        };
       }
-      const snapshot = {
-        header: structuredClone(sourceHeader),
-        entries: structuredClone(ctx.sessionManager.getEntries()),
-      };
-      const fork = forkSession(sourceSession, targetCwd, snapshot);
+      const targetSessionDir = ctx.sessionManager.usesDefaultSessionDir()
+        ? undefined
+        : ctx.sessionManager.getSessionDir();
+      const fork = forkSession(
+        sourceSession,
+        targetCwd,
+        snapshot,
+        targetSessionDir,
+      );
       destinationSession =
         typeof fork === "string" ? fork : fork.destinationSession;
-      deferredSourceSnapshot =
-        typeof fork === "string" ? undefined : fork.sourceSnapshot;
     } catch (error) {
       throw new WorktrunkError(
         `Could not create the session continuation: ${
@@ -282,20 +280,6 @@ export function createSessionContinuator(forkSession: ForkSession) {
 
     const result = await ctx.switchSession(destinationSession, {
       withSession: async (nextCtx) => {
-        let sourcePreserved = deferredSourceSnapshot === undefined;
-        if (deferredSourceSnapshot) {
-          try {
-            materializeSessionSnapshot(sourceSession, deferredSourceSnapshot);
-            sourcePreserved = true;
-          } catch (error) {
-            nextCtx.ui.notify(
-              `The session switched, but Pi could not preserve the fresh source session: ${
-                error instanceof Error ? error.message : String(error)
-              }`,
-              "warning",
-            );
-          }
-        }
         try {
           await nextCtx.sendMessage({
             customType: "↪ Continued in worktree",
@@ -318,9 +302,7 @@ export function createSessionContinuator(forkSession: ForkSession) {
           );
         }
         nextCtx.ui.notify(
-          `Continued the session in ${target.branch ?? targetCwd}.${
-            sourcePreserved ? "\nThe source session remains available." : ""
-          }`,
+          `Continued the session in ${target.branch ?? targetCwd}.\nThe source session remains available.`,
           "info",
         );
       },

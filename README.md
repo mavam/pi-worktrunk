@@ -72,6 +72,8 @@ Before switching, the extension shows the source and target directories and asks
 for confirmation. It then creates a new pi session in the target worktree, links
 it to the source session through Pi's parent-session metadata, and switches the
 current pi process to the new session. The source session remains available.
+Continuation also keeps Pi's active session storage policy, including a custom
+shared session directory.
 
 The copied history keeps its original text. A visible transition message tells
 the model about the new working directory and warns that historical absolute

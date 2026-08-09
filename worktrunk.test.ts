@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
 import { SessionManager } from "@earendil-works/pi-coding-agent";
@@ -15,6 +15,7 @@ import extension, {
   forkSessionFromSnapshot,
   handleWorktreeCommand,
   markerArgs,
+  materializeSessionSnapshot,
 } from "./worktrunk.ts";
 
 const worktreeList = JSON.stringify({
@@ -250,17 +251,19 @@ test("/worktree continue resolves an existing worktree", async () => {
 });
 
 test("session continuation forks, switches, and records the cwd transition", async () => {
-  const forks: Array<[string, string]> = [];
+  const forks: Array<[string, string, string | undefined]> = [];
   const confirmations: Array<[string, string]> = [];
   const switched: string[] = [];
   const messages: any[] = [];
   const notifications: Array<[string, string]> = [];
   let waited = false;
 
-  const continueSession = createSessionContinuator((source, target) => {
-    forks.push([source, target]);
-    return "/sessions/continued.jsonl";
-  });
+  const continueSession = createSessionContinuator(
+    (source, target, _snapshot, targetSessionDir) => {
+      forks.push([source, target, targetSessionDir]);
+      return "/sessions/continued.jsonl";
+    },
+  );
 
   const continued = await continueSession(
     {
@@ -281,6 +284,12 @@ test("session continuation forks, switches, and records the cwd transition", asy
         },
         getEntries() {
           return [];
+        },
+        usesDefaultSessionDir() {
+          return true;
+        },
+        getSessionDir() {
+          throw new Error("default session directory should be implicit");
         },
       },
       async waitForIdle() {
@@ -316,7 +325,7 @@ test("session continuation forks, switches, and records the cwd transition", asy
   assert.equal(continued, true);
   assert.equal(waited, true);
   assert.deepEqual(forks, [
-    ["/sessions/source.jsonl", "/repo.feature-auth"],
+    ["/sessions/source.jsonl", "/repo.feature-auth", undefined],
   ]);
   assert.deepEqual(switched, ["/sessions/continued.jsonl"]);
   assert.equal(confirmations[0][0], "↪ Continue in feature/auth?");
@@ -341,13 +350,11 @@ test("session continuation forks, switches, and records the cwd transition", asy
   );
 });
 
-test("session continuation handles a source session that pi has not written yet", async () => {
+test("session continuation keeps a fresh source in its custom session directory", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-test-"));
   try {
-    const sourceManager = SessionManager.create(
-      "/repo",
-      join(root, "source-sessions"),
-    );
+    const sessionDir = join(root, "sessions");
+    const sourceManager = SessionManager.create("/repo", sessionDir);
     sourceManager.appendSessionInfo("fresh session");
     const sourceSession = sourceManager.getSessionFile();
     assert.ok(sourceSession);
@@ -355,12 +362,13 @@ test("session continuation handles a source session that pi has not written yet"
 
     let destinationSession: string | undefined;
     const continueSession = createSessionContinuator(
-      (source, target, snapshot) => {
+      (source, target, snapshot, targetSessionDir) => {
+        assert.equal(targetSessionDir, sessionDir);
         const fork = forkSessionFromSnapshot(
           source,
           target,
           snapshot,
-          join(root, "target-sessions"),
+          targetSessionDir,
         );
         destinationSession = fork.destinationSession;
         return fork;
@@ -393,6 +401,7 @@ test("session continuation handles a source session that pi has not written yet"
 
     assert.equal(continued, true);
     assert.ok(destinationSession);
+    assert.equal(dirname(destinationSession), sessionDir);
     assert.equal(existsSync(sourceSession), true);
     assert.equal(existsSync(destinationSession), true);
 
@@ -411,6 +420,123 @@ test("session continuation handles a source session that pi has not written yet"
     assert.equal(destinationEntries[0].cwd, "/repo.main");
     assert.equal(destinationEntries[0].parentSession, sourceSession);
     assert.deepEqual(destinationEntries.slice(1), sourceEntries.slice(1));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("session continuation does not snapshot a persisted custom-directory source", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-test-"));
+  try {
+    const sessionDir = join(root, "sessions");
+    const sourceManager = SessionManager.create("/repo", sessionDir);
+    sourceManager.appendSessionInfo("persisted session");
+    const sourceSession = sourceManager.getSessionFile();
+    const sourceHeader = sourceManager.getHeader();
+    assert.ok(sourceSession);
+    assert.ok(sourceHeader);
+    materializeSessionSnapshot(sourceSession, {
+      header: sourceHeader,
+      entries: sourceManager.getEntries(),
+    });
+
+    let destinationSession: string | undefined;
+    const continueSession = createSessionContinuator(
+      (source, target, snapshot, targetSessionDir) => {
+        assert.equal(snapshot, undefined);
+        assert.equal(targetSessionDir, sessionDir);
+        const fork = forkSessionFromSnapshot(
+          source,
+          target,
+          snapshot,
+          targetSessionDir,
+        );
+        destinationSession = fork.destinationSession;
+        return fork;
+      },
+    );
+
+    const continued = await continueSession(
+      {
+        cwd: "/repo",
+        hasUI: true,
+        sessionManager: {
+          getSessionFile: () => sourceSession,
+          getHeader() {
+            throw new Error("persisted sources should not request a header");
+          },
+          getEntries() {
+            throw new Error("persisted sources should not request entries");
+          },
+          usesDefaultSessionDir: () => false,
+          getSessionDir: () => sessionDir,
+        },
+        async waitForIdle() {},
+        ui: {
+          async confirm() {
+            return true;
+          },
+          notify() {},
+        },
+        async switchSession(path: string, options: any) {
+          assert.equal(path, destinationSession);
+          await options.withSession({
+            async sendMessage() {},
+            ui: { notify() {} },
+          });
+          return { cancelled: false };
+        },
+      } as any,
+      { branch: "main", path: "/repo.main" },
+    );
+
+    assert.equal(continued, true);
+    assert.ok(destinationSession);
+    assert.equal(dirname(destinationSession), sessionDir);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("session continuation preserves a fresh source when switching fails", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-test-"));
+  try {
+    const sessionDir = join(root, "sessions");
+    const sourceManager = SessionManager.create("/repo", sessionDir);
+    sourceManager.appendSessionInfo("fresh session");
+    const sourceSession = sourceManager.getSessionFile();
+    assert.ok(sourceSession);
+    assert.equal(existsSync(sourceSession), false);
+
+    const continueSession = createSessionContinuator(forkSessionFromSnapshot);
+    await assert.rejects(
+      continueSession(
+        {
+          cwd: "/repo",
+          hasUI: true,
+          sessionManager: sourceManager,
+          async waitForIdle() {},
+          ui: {
+            async confirm() {
+              return true;
+            },
+            notify() {},
+          },
+          async switchSession() {
+            throw new Error("target runtime failed");
+          },
+        } as any,
+        { branch: "main", path: "/repo.main" },
+      ),
+      /target runtime failed/,
+    );
+
+    assert.equal(existsSync(sourceSession), true);
+    const sourceEntries = (await readFile(sourceSession, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.equal(sourceEntries[1].name, "fresh session");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
