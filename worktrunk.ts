@@ -976,7 +976,7 @@ class WorktrunkOutput implements Component {
   render(width: number): string[] {
     return this.text
       .split("\n")
-      .map((line) => truncateToWidth(line, Math.max(1, width), ""));
+      .map((line) => truncateToWidth(line, Math.max(1, width), "…"));
   }
 
   invalidate(): void {}

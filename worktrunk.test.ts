@@ -6,6 +6,7 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
 
 import extension, {
   MARKERS,
@@ -722,6 +723,26 @@ test("worktree tool renders native output for every action", async () => {
     tool.renderResult(list).render(120),
     nativeList.split("\n"),
   );
+
+  const linkedRow =
+    "@ " +
+    "\x1b]8;;https://example.com/feature/auth\x07" +
+    "feature/auth-with-a-long-name" +
+    "\x1b]8;;\x07" +
+    "  \x1b[36m!↑\x1b[0m";
+  const [narrowRow] = tool
+    .renderResult({
+      content: [{ type: "text", text: "structured output" }],
+      details: {
+        action: "list",
+        truncated: false,
+        display: linkedRow,
+      },
+    })
+    .render(20);
+  assert.equal(visibleWidth(narrowRow), 20);
+  assert.match(narrowRow, /…/);
+  assert.match(narrowRow, /\x1b]8;;\x07/);
 
   const status = await execute({ action: "status" });
   assert.equal(status.details.display, "main  ^|");
