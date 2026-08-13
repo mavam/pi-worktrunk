@@ -92,9 +92,9 @@ The extension registers one `worktree` tool with these actions:
 | `path` | Optional `target` | Resolve a worktree path without changing directories. |
 | `settings` | None | Inspect the active Worktrunk configuration. |
 
-The extension requests Worktrunk's JSON schema 2 explicitly. Tool output is
-limited to 2,000 lines or 50 KB. The extension saves larger output to a
-temporary file and returns its path.
+The model receives Worktrunk JSON schema 2, while Pi's TUI shows Worktrunk's
+native text output. Tool output is limited to 2,000 lines or 50 KB. The
+extension saves larger output to a temporary file and returns its path.
 
 The agent tool can create and resolve worktrees, but it can't switch the active
 pi session. Use `/worktree continue` for that user-confirmed transition.

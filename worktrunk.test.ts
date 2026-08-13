@@ -41,7 +41,7 @@ const worktreeList = JSON.stringify({
         },
       },
       upstream: { ahead: 0, behind: 0 },
-      display: { state: "is_main", symbols: "^|" },
+      display: { state: "is_main", symbols: "^|", statusline: "main  ^|" },
     },
     {
       branch: "feature/auth",
@@ -61,7 +61,11 @@ const worktreeList = JSON.stringify({
         },
       },
       default_branch: { ahead: 2, behind: 0 },
-      display: { state: "ahead", symbols: "!↑" },
+      display: {
+        state: "ahead",
+        symbols: "!↑",
+        statusline: "feature/auth  !↑",
+      },
     },
   ],
 });
@@ -95,6 +99,9 @@ test("Worktrunk client exposes the supported lifecycle operations", async () => 
   const calls: Array<{ args: string[]; cwd?: string }> = [];
   const client = createWorktrunkClient(async (args, options) => {
     calls.push({ args: [...args], cwd: options?.cwd });
+    if (args.length === 1 && args[0] === "list") {
+      return { code: 0, stdout: "@ main  ^|" };
+    }
     if (args.includes("list")) return { code: 0, stdout: worktreeList };
     if (args[0] === "switch") {
       return {
@@ -103,7 +110,11 @@ test("Worktrunk client exposes the supported lifecycle operations", async () => 
           action: "created",
           branch: "feature/new",
           path: "/repo.feature-new",
+          created_branch: true,
+          base_branch: "main",
         }),
+        stderr:
+          "✓ Created branch feature/new from main and worktree @ /repo.feature-new\n",
       };
     }
     if (args[0] === "remove") {
@@ -111,29 +122,47 @@ test("Worktrunk client exposes the supported lifecycle operations", async () => 
         code: 0,
         stdout: JSON.stringify([
           {
+            kind: "worktree",
             branch: "feature/new",
             path: "/repo.feature-new",
-            branch_deleted: true,
+            branch_outcome: "deleted",
           },
         ]),
+        stderr: "✓ Removed feature/new worktree & branch\n",
       };
+    }
+    if (args[0] === "config" && !args.includes("--format=json")) {
+      return { code: 0, stdout: "USER CONFIG @ /config.toml" };
     }
     return { code: 0, stdout: "{}" };
   });
 
   assert.equal((await client.status("/repo"))?.branch, "main");
+  assert.equal(await client.listText("/repo"), "@ main  ^|");
   assert.deepEqual(await client.create("/repo", "feature/new"), {
     branch: "feature/new",
     path: "/repo.feature-new",
+    createdBranch: true,
+    baseBranch: "main",
+    display:
+      "✓ Created branch feature/new from main and worktree @ /repo.feature-new",
   });
-  assert.deepEqual(await client.remove("/repo", "feature/new"), [
-    {
-      branch: "feature/new",
-      path: "/repo.feature-new",
-      branch_deleted: true,
-    },
-  ]);
+  assert.deepEqual(await client.remove("/repo", "feature/new"), {
+    outcomes: [
+      {
+        kind: "worktree",
+        branch: "feature/new",
+        path: "/repo.feature-new",
+        branch_outcome: "deleted",
+      },
+    ],
+    display: "✓ Removed feature/new worktree & branch",
+  });
   assert.equal(await client.settings("/repo"), "{}");
+  assert.equal(
+    await client.settingsText("/repo"),
+    "USER CONFIG @ /config.toml",
+  );
 
   assert.deepEqual(calls, [
     {
@@ -143,6 +172,10 @@ test("Worktrunk client exposes the supported lifecycle operations", async () => 
         "list",
         "--format=json",
       ],
+      cwd: "/repo",
+    },
+    {
+      args: ["list"],
       cwd: "/repo",
     },
     {
@@ -161,6 +194,10 @@ test("Worktrunk client exposes the supported lifecycle operations", async () => 
     },
     {
       args: ["config", "show", "--format=json"],
+      cwd: "/repo",
+    },
+    {
+      args: ["config", "show"],
       cwd: "/repo",
     },
   ]);
@@ -582,6 +619,131 @@ test("session continuation leaves Pi in place when confirmation is declined", as
       "info",
     ],
   ]);
+});
+
+test("worktree tool renders native output for every action", async () => {
+  let tool: any;
+  const calls: string[][] = [];
+  const nativeList = [
+    "  Branch        Status  Path",
+    "@ main              ^   .",
+    "+ feature/auth      !↑  ../repo.feature-auth",
+    "",
+    "○ Showing 2 worktrees, 1 with changes",
+  ].join("\n");
+  const nativeCreate =
+    "✓ Created branch feature/new from main and worktree @ /repo.feature-new";
+  const nativeRemove =
+    "✓ Removed feature/auth worktree & branch (same commit as main, _)";
+  const nativeSettings = "USER CONFIG @ /config.toml";
+
+  extension({
+    on() {},
+    registerCommand() {},
+    registerTool(definition: any) {
+      tool = definition;
+    },
+    async exec(_command: string, args: string[]) {
+      calls.push([...args]);
+      if (args.length === 1 && args[0] === "list") {
+        const [table, summary] = nativeList.split("\n\n");
+        return {
+          code: 0,
+          stdout: table,
+          stderr: `\n${summary}`,
+          killed: false,
+        };
+      }
+      if (args[0] === "switch") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            action: "created",
+            branch: "feature/new",
+            path: "/repo.feature-new",
+            created_branch: true,
+            base_branch: "main",
+          }),
+          stderr: nativeCreate,
+          killed: false,
+        };
+      }
+      if (args[0] === "remove") {
+        return {
+          code: 0,
+          stdout: JSON.stringify([
+            {
+              kind: "worktree",
+              branch: "feature/auth",
+              path: "/repo.feature-auth",
+              branch_outcome: "deleted",
+            },
+          ]),
+          stderr: nativeRemove,
+          killed: false,
+        };
+      }
+      if (args[0] === "config" && args.includes("--format=json")) {
+        return {
+          code: 0,
+          stdout: '{"user":{"exists":true}}',
+          stderr: "",
+          killed: false,
+        };
+      }
+      if (args[0] === "config") {
+        return {
+          code: 0,
+          stdout: nativeSettings,
+          stderr: "",
+          killed: false,
+        };
+      }
+      if (args.includes("--format=json")) {
+        return { code: 0, stdout: worktreeList, stderr: "", killed: false };
+      }
+      throw new Error(`unexpected Worktrunk call: ${args.join(" ")}`);
+    },
+  } as any);
+
+  const execute = (params: Record<string, string>) =>
+    tool.execute(
+      `call-${params.action}`,
+      params,
+      new AbortController().signal,
+      undefined,
+      { cwd: "/repo", mode: "tui" },
+    );
+
+  const list = await execute({ action: "list" });
+  assert.match(list.content[0].text, /"worktrees"/);
+  assert.equal(list.details.display, nativeList);
+  assert.deepEqual(
+    tool.renderResult(list).render(120),
+    nativeList.split("\n"),
+  );
+
+  const status = await execute({ action: "status" });
+  assert.equal(status.details.display, "main  ^|");
+
+  const create = await execute({ action: "create", branch: "feature/new" });
+  assert.equal(create.details.display, nativeCreate);
+
+  const remove = await execute({ action: "remove", target: "feature/auth" });
+  assert.equal(remove.details.display, nativeRemove);
+  assert.match(remove.content[0].text, /"branch_outcome": "deleted"/);
+
+  const path = await execute({ action: "path", target: "feature/auth" });
+  assert.equal(path.details.display, "/repo.feature-auth");
+
+  const settings = await execute({ action: "settings" });
+  assert.equal(settings.details.display, nativeSettings);
+
+  assert.ok(calls.some((args) => args.join(" ") === "list"));
+  assert.ok(
+    calls.some((args) =>
+      args.join(" ") === "config show"),
+  );
 });
 
 test("extension registers markers, /worktree, and the worktree tool", () => {

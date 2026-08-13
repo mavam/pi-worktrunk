@@ -14,6 +14,11 @@ import {
   type SessionEntry,
   type SessionHeader,
 } from "@earendil-works/pi-coding-agent";
+import {
+  Text,
+  truncateToWidth,
+  type Component,
+} from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 export const MARKERS = {
@@ -102,6 +107,7 @@ type WorktreeItem = {
   display?: {
     state?: string;
     symbols?: string;
+    statusline?: string;
   };
 };
 
@@ -110,10 +116,32 @@ type WorktreeList = {
   items: WorktreeItem[];
 };
 
+type BranchOutcome =
+  | "deleted"
+  | "deferred"
+  | "not_attempted"
+  | "retained_unmerged"
+  | "retained_checked_out"
+  | "retained_raced"
+  | "retained_failed";
+
 type RemovalOutcome = {
+  kind?: "worktree" | "branch";
   branch: string | null;
-  path: string;
-  branch_deleted: boolean;
+  path?: string;
+  pruned?: boolean;
+  branch_outcome?: BranchOutcome;
+  branch_checked_out_at?: string | null;
+  branch_deleted?: boolean;
+};
+
+type ToolOutputDetails = {
+  action: WorktreeAction;
+  truncated: boolean;
+  fullOutputPath?: string;
+  display?: string;
+  displayTruncated?: boolean;
+  displayFullOutputPath?: string;
 };
 
 export function markerArgs(marker?: string): string[] {
@@ -431,22 +459,40 @@ export function createWorktrunkClient(runWt: RunWt) {
       );
     },
 
+    async listText(cwd: string, signal?: AbortSignal) {
+      const result = await run(["list"], cwd, signal);
+      const table = result.stdout?.trimEnd() ?? "";
+      const summary = result.stderr?.trim() ?? "";
+      return [table, summary].filter(Boolean).join("\n\n");
+    },
+
     async create(cwd: string, branch: string, signal?: AbortSignal) {
       const result = await run(
         ["switch", "--create", "--no-cd", "--format=json", branch],
         cwd,
         signal,
       );
-      const created = parseJson<{ branch?: string; path?: string }>(
-        result.stdout ?? "",
-        "wt switch --format=json",
-      );
+      const created = parseJson<{
+        branch?: string;
+        path?: string;
+        created_branch?: boolean;
+        base_branch?: string;
+      }>(result.stdout ?? "", "wt switch --format=json");
       if (!created.path) {
         throw new WorktrunkError(
           `Worktrunk created ${branch}, but did not report its path.`,
         );
       }
-      return { branch: created.branch ?? branch, path: created.path };
+      const display = result.stderr?.trimEnd();
+      return {
+        branch: created.branch ?? branch,
+        path: created.path,
+        ...(created.created_branch !== undefined
+          ? { createdBranch: created.created_branch }
+          : {}),
+        ...(created.base_branch ? { baseBranch: created.base_branch } : {}),
+        ...(display ? { display } : {}),
+      };
     },
 
     async remove(cwd: string, ref: string, signal?: AbortSignal) {
@@ -455,10 +501,13 @@ export function createWorktrunkClient(runWt: RunWt) {
         cwd,
         signal,
       );
-      return parseJson<RemovalOutcome[]>(
-        result.stdout ?? "",
-        "wt remove --format=json",
-      );
+      return {
+        outcomes: parseJson<RemovalOutcome[]>(
+          result.stdout ?? "",
+          "wt remove --format=json",
+        ),
+        display: result.stderr?.trimEnd() || undefined,
+      };
     },
 
     async settings(cwd: string, signal?: AbortSignal) {
@@ -468,6 +517,11 @@ export function createWorktrunkClient(runWt: RunWt) {
         signal,
       );
       return result.stdout?.trim() ?? "";
+    },
+
+    async settingsText(cwd: string, signal?: AbortSignal) {
+      const result = await run(["config", "show"], cwd, signal);
+      return result.stdout?.trimEnd() ?? "";
     },
   };
 }
@@ -738,12 +792,15 @@ async function commandRemove(
     return;
   }
 
-  const [outcome] = await client.remove(ctx.cwd, ref);
+  const removal = await client.remove(ctx.cwd, ref);
+  const [outcome] = removal.outcomes;
   const label = target.branch ?? outcome?.path ?? ref;
+  const branchDeleted =
+    outcome?.branch_outcome === "deleted" || outcome?.branch_deleted === true;
   ctx.ui.notify(
-    outcome?.branch && !outcome.branch_deleted
+    outcome?.branch && !branchDeleted
       ? `Removed the worktree for ${label}. Worktrunk retained branch ${outcome.branch}.`
-      : outcome?.branch_deleted
+      : branchDeleted
         ? `Removed the worktree and branch ${label}.`
         : `Removed worktree ${label}.`,
     "info",
@@ -788,7 +845,7 @@ async function commandSettings(
   client: WorktrunkClient,
 ): Promise<void> {
   requireNoArgs(args, "/worktree settings");
-  const settings = await client.settings(ctx.cwd);
+  const settings = await client.settingsText(ctx.cwd);
   ctx.ui.notify(settings || "No Worktrunk configuration found.", "info");
 }
 
@@ -848,36 +905,103 @@ export async function handleWorktreeCommand(
   }
 }
 
-async function formatToolOutput(action: WorktreeAction, output: string) {
+async function formatToolOutput(
+  action: WorktreeAction,
+  output: string,
+  suffix?: string,
+) {
   const text = output || "(no output)";
   const truncation = truncateHead(text, {
     maxLines: DEFAULT_MAX_LINES,
     maxBytes: DEFAULT_MAX_BYTES,
   });
   if (!truncation.truncated) {
-    return { text, details: { action, truncated: false } };
+    return { text, truncated: false as const };
   }
 
   const directory = await mkdtemp(join(tmpdir(), "pi-worktrunk-"));
-  const fullOutputPath = join(directory, `${action}.txt`);
+  const filename = suffix ? `${action}-${suffix}.txt` : `${action}.txt`;
+  const fullOutputPath = join(directory, filename);
   await writeFile(fullOutputPath, text, "utf8");
   const notice =
     `\n\n[Output truncated to ${DEFAULT_MAX_LINES} lines or ` +
     `${formatSize(DEFAULT_MAX_BYTES)}. Full output: ${fullOutputPath}]`;
   return {
     text: truncation.content + notice,
-    details: { action, truncated: true, fullOutputPath },
+    truncated: true as const,
+    fullOutputPath,
   };
 }
 
-async function toolResult(action: WorktreeAction, value: unknown) {
+async function toolResult(
+  action: WorktreeAction,
+  value: unknown,
+  display?: string,
+) {
   const text =
     typeof value === "string" ? value : JSON.stringify(value, null, 2);
   const output = await formatToolOutput(action, text);
+  const rendered = display
+    ? await formatToolOutput(action, display, "display")
+    : undefined;
+  const details: ToolOutputDetails = {
+    action,
+    truncated: output.truncated,
+    ...(output.fullOutputPath
+      ? { fullOutputPath: output.fullOutputPath }
+      : {}),
+    ...(rendered
+      ? {
+          display: rendered.text,
+          displayTruncated: rendered.truncated,
+          ...(rendered.fullOutputPath
+            ? { displayFullOutputPath: rendered.fullOutputPath }
+            : {}),
+        }
+      : {}),
+  };
   return {
     content: [{ type: "text" as const, text: output.text }],
-    details: output.details,
+    details,
   };
+}
+
+class WorktrunkOutput implements Component {
+  private readonly text: string;
+
+  constructor(text: string) {
+    this.text = text;
+  }
+
+  render(width: number): string[] {
+    return this.text
+      .split("\n")
+      .map((line) => truncateToWidth(line, Math.max(1, width), ""));
+  }
+
+  invalidate(): void {}
+}
+
+function resultText(result: {
+  content: Array<{ type: string; text?: string }>;
+  details?: unknown;
+}): string {
+  const details = result.details as ToolOutputDetails | undefined;
+  if (details?.display) return details.display;
+  const text = result.content.find((item) => item.type === "text")?.text;
+  return text ?? "";
+}
+
+async function tuiDisplay(
+  mode: string,
+  getDisplay: () => Promise<string>,
+): Promise<string | undefined> {
+  if (mode !== "tui") return undefined;
+  try {
+    return await getDisplay();
+  } catch {
+    return undefined;
+  }
 }
 
 async function removeWithTool(
@@ -885,7 +1009,7 @@ async function removeWithTool(
   cwd: string,
   targetRef: string | undefined,
   signal?: AbortSignal,
-): Promise<RemovalOutcome[]> {
+) {
   const ref = targetRef?.trim();
   if (!ref) throw new WorktrunkError("The remove action requires `target`.");
   const target = resolveWorktree(await client.list(cwd, signal), ref);
@@ -945,10 +1069,13 @@ export default function (pi: ExtensionAPI) {
     executionMode: "sequential",
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       switch (params.action) {
-        case "list":
-          return toolResult("list", {
-            worktrees: await client.list(ctx.cwd, signal),
-          });
+        case "list": {
+          const worktrees = await client.list(ctx.cwd, signal);
+          const display = await tuiDisplay(ctx.mode, () =>
+            client.listText(ctx.cwd, signal),
+          );
+          return toolResult("list", { worktrees }, display);
+        }
         case "status": {
           const current = await client.status(ctx.cwd, signal);
           if (!current) {
@@ -956,29 +1083,44 @@ export default function (pi: ExtensionAPI) {
               "The current directory is not a Worktrunk-managed worktree.",
             );
           }
-          return toolResult("status", current);
+          return toolResult("status", current, current.display?.statusline);
         }
         case "create": {
-          const created = await client.create(
+          const result = await client.create(
             ctx.cwd,
             requireBranch(params.branch?.trim() ?? ""),
             signal,
           );
-          return toolResult("create", {
-            created,
-            currentDirectory: ctx.cwd,
-            directoryChanged: false,
-          });
+          const {
+            display,
+            branch,
+            path,
+            createdBranch,
+            baseBranch,
+          } = result;
+          return toolResult(
+            "create",
+            {
+              created: { branch, path, createdBranch, baseBranch },
+              currentDirectory: ctx.cwd,
+              directoryChanged: false,
+            },
+            display,
+          );
         }
-        case "remove":
-          return toolResult("remove", {
-            removed: await removeWithTool(
-              client,
-              ctx.cwd,
-              params.target,
-              signal,
-            ),
-          });
+        case "remove": {
+          const removal = await removeWithTool(
+            client,
+            ctx.cwd,
+            params.target,
+            signal,
+          );
+          return toolResult(
+            "remove",
+            { removed: removal.outcomes },
+            removal.display,
+          );
+        }
         case "path": {
           const worktrees = await client.list(ctx.cwd, signal);
           const ref = params.target?.trim();
@@ -990,19 +1132,41 @@ export default function (pi: ExtensionAPI) {
               ref ? `Worktree not found: ${ref}` : "Current worktree not found.",
             );
           }
-          return toolResult("path", {
-            branch: target.branch,
-            path: target.worktree.path,
-            currentDirectory: ctx.cwd,
-            directoryChanged: false,
-          });
-        }
-        case "settings":
           return toolResult(
-            "settings",
-            await client.settings(ctx.cwd, signal),
+            "path",
+            {
+              branch: target.branch,
+              path: target.worktree.path,
+              currentDirectory: ctx.cwd,
+              directoryChanged: false,
+            },
+            target.worktree.path,
           );
+        }
+        case "settings": {
+          const settings = await client.settings(ctx.cwd, signal);
+          const display = await tuiDisplay(ctx.mode, () =>
+            client.settingsText(ctx.cwd, signal),
+          );
+          return toolResult("settings", settings, display);
+        }
       }
+    },
+    renderCall(args, theme) {
+      let text = theme.fg(
+        "toolTitle",
+        theme.bold(`Worktrunk ${args.action}`),
+      );
+      const operand = args.branch ?? args.target;
+      if (operand) text += ` ${theme.fg("muted", operand)}`;
+      return new Text(text, 0, 0);
+    },
+    renderResult(result) {
+      const details = result.details as ToolOutputDetails | undefined;
+      const text = resultText(result);
+      return details?.action === "list" || details?.action === "status"
+        ? new WorktrunkOutput(text)
+        : new Text(text, 0, 0);
     },
   });
 
