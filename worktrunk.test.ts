@@ -77,14 +77,13 @@ test("Worktrunk aliases are parsed from help output", () => {
   const output = `wt - Git worktree management
 
 Aliases:
-  deploy
-  land
-  deploy
+  deploy, land, deploy
 
 Run wt config alias show for the full definitions.
 `;
 
   assert.deepEqual(parseWorktrunkAliasNames(output), ["deploy", "land"]);
+  assert.deepEqual(parseWorktrunkAliasNames("Aliases:\n  land\n"), ["land"]);
   assert.deepEqual(parseWorktrunkAliasNames("wt help without aliases"), []);
 });
 
@@ -1050,6 +1049,7 @@ test("extension exposes Worktrunk aliases under /worktree", async () => {
   const commands = new Map<string, any>();
   const calls: Array<{ program: string; args: string[]; cwd?: string }> = [];
   const notifications: Array<{ message: string; level: string }> = [];
+  let helpFails = false;
 
   try {
     extension({
@@ -1067,13 +1067,15 @@ test("extension exposes Worktrunk aliases under /worktree", async () => {
           return { code: 1, stdout: "", stderr: "", killed: false };
         }
         if (args.length === 1 && args[0] === "--help") {
-          return {
-            code: 0,
-            stdout:
-              "Commands:\n  list\n\nAliases:\n  land\n  list\n  worktree\n\nOptions:\n",
-            stderr: "",
-            killed: false,
-          };
+          return helpFails
+            ? { code: 1, stdout: "", stderr: "failed", killed: false }
+            : {
+                code: 0,
+                stdout:
+                  "Commands:\n  list\n\nAliases:\n  land, list, worktree\n\nOptions:\n",
+                stderr: "",
+                killed: false,
+              };
         }
         if (args[0] === "land") {
           await rm(root, { recursive: true, force: true });
@@ -1093,10 +1095,20 @@ test("extension exposes Worktrunk aliases under /worktree", async () => {
       sessionManager: { getEntries: () => [] },
     };
     await handlers.get("session_start")?.({}, sessionContext);
-    await handlers.get("session_start")?.({}, sessionContext);
 
     assert.deepEqual([...commands.keys()], ["worktree"]);
     const command = commands.get("worktree");
+    assert.deepEqual(command.getArgumentCompletions("la"), [
+      { value: "land", label: "land" },
+    ]);
+    assert.deepEqual(command.getArgumentCompletions("wo"), []);
+
+    helpFails = true;
+    await handlers.get("session_start")?.({}, sessionContext);
+    assert.deepEqual(command.getArgumentCompletions("la"), []);
+
+    helpFails = false;
+    await handlers.get("session_start")?.({}, sessionContext);
     assert.deepEqual(command.getArgumentCompletions("la"), [
       { value: "land", label: "land" },
     ]);

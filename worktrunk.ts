@@ -652,6 +652,7 @@ const RESERVED_SUBCOMMANDS = new Set<string>([
   "ls",
   "rm",
   "config",
+  "worktree",
 ]);
 
 function helpText(aliases: readonly string[]): string {
@@ -688,9 +689,11 @@ export function parseWorktrunkAliasNames(output: string): string[] {
     if (!line.trim()) break;
     if (!/^\s/.test(line)) break;
 
-    const [name] = line.trim().split(/\s+/);
-    if (WORKTRUNK_ALIAS_NAME.test(name) && !aliases.includes(name)) {
-      aliases.push(name);
+    for (const value of line.split(",")) {
+      const name = value.trim();
+      if (WORKTRUNK_ALIAS_NAME.test(name) && !aliases.includes(name)) {
+        aliases.push(name);
+      }
     }
   }
 
@@ -1309,6 +1312,7 @@ export default function (pi: ExtensionAPI) {
   const worktrunkAliases = new Set<string>();
 
   async function discoverAliases(ctx: ExtensionContext) {
+    worktrunkAliases.clear();
     let result: WtResult;
     try {
       result = await runWt(["--help"], {
@@ -1320,7 +1324,6 @@ export default function (pi: ExtensionAPI) {
     }
     if (result.code !== 0) return;
 
-    worktrunkAliases.clear();
     for (const alias of parseWorktrunkAliasNames(result.stdout ?? "")) {
       if (!RESERVED_SUBCOMMANDS.has(alias)) worktrunkAliases.add(alias);
     }
