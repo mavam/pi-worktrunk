@@ -624,16 +624,16 @@ function removableRef(item: WorktreeItem): string {
 }
 
 const HELP_TEXT = `
-/worktree - Manage worktrees with Worktrunk
+/wt - Manage worktrees with Worktrunk
 
 Commands:
-  /worktree list                           Select and inspect a worktree
-  /worktree create <branch> [--continue]   Create a worktree and optionally continue there
-  /worktree continue [target]              Continue this Pi session in a worktree
-  /worktree remove [target]                Remove a worktree and any safe-to-delete branch
-  /worktree status                         Show the current worktree
-  /worktree cd [target]                    Show a worktree path
-  /worktree settings                       Show the active Worktrunk configuration
+  /wt list                           Select and inspect a worktree
+  /wt create <branch> [--continue]   Create a worktree and optionally continue there
+  /wt continue [target]              Continue this Pi session in a worktree
+  /wt remove [target]                Remove a worktree and any safe-to-delete branch
+  /wt status                         Show the current worktree
+  /wt cd [target]                    Show a worktree path
+  /wt settings                       Show the active Worktrunk configuration
 `.trim();
 
 const SUBCOMMANDS = [
@@ -659,7 +659,7 @@ function helpText(aliases: readonly string[]): string {
   if (aliases.length === 0) return HELP_TEXT;
   return (
     `${HELP_TEXT}\n\nWorktrunk aliases:\n` +
-    aliases.map((alias) => `  /worktree ${alias} [args]`).join("\n")
+    aliases.map((alias) => `  /wt ${alias} [args]`).join("\n")
   );
 }
 
@@ -760,7 +760,7 @@ function requireNoArgs(args: string, usage: string): void {
 
 function requireBranch(args: string): string {
   if (!args || /\s/.test(args) || args.startsWith("-")) {
-    throw new WorktrunkError("Usage: /worktree create <branch>");
+    throw new WorktrunkError("Usage: /wt create <branch>");
   }
   return args;
 }
@@ -778,7 +778,7 @@ function parseCreateArgs(args: string): {
     positional[0].startsWith("-")
   ) {
     throw new WorktrunkError(
-      "Usage: /worktree create <branch> [--continue]",
+      "Usage: /wt create <branch> [--continue]",
     );
   }
   return { branch: positional[0], continueSession: continueFlags.length === 1 };
@@ -801,7 +801,7 @@ async function commandList(
   ctx: ExtensionCommandContext,
   client: WorktrunkClient,
 ): Promise<void> {
-  requireNoArgs(args, "/worktree list");
+  requireNoArgs(args, "/wt list");
   const worktrees = await client.list(ctx.cwd);
   if (worktrees.length === 0) {
     ctx.ui.notify("No worktrees found.", "info");
@@ -868,7 +868,7 @@ async function commandContinue(
   if (!target) {
     if (!args && !ctx.hasUI) {
       throw new WorktrunkError(
-        "Usage: /worktree continue <branch-or-path>",
+        "Usage: /wt continue <branch-or-path>",
       );
     }
     if (args) throw new WorktrunkError(`Worktree not found: ${args}`);
@@ -906,7 +906,7 @@ async function commandRemove(
 
   if (!target) {
     if (!args && !ctx.hasUI) {
-      throw new WorktrunkError("Usage: /worktree remove <branch-or-path>");
+      throw new WorktrunkError("Usage: /wt remove <branch-or-path>");
     }
     if (args) throw new WorktrunkError(`Worktree not found: ${args}`);
     return;
@@ -943,7 +943,7 @@ async function commandStatus(
   ctx: ExtensionCommandContext,
   client: WorktrunkClient,
 ): Promise<void> {
-  requireNoArgs(args, "/worktree status");
+  requireNoArgs(args, "/wt status");
   if (!existsSync(ctx.cwd)) {
     throw new WorktrunkError(missingCwdMessage(ctx.cwd));
   }
@@ -981,7 +981,7 @@ async function commandSettings(
   ctx: ExtensionCommandContext,
   client: WorktrunkClient,
 ): Promise<void> {
-  requireNoArgs(args, "/worktree settings");
+  requireNoArgs(args, "/wt settings");
   const settings = await client.settingsText(ctx.cwd);
   ctx.ui.notify(settings || "No Worktrunk configuration found.", "info");
 }
@@ -1111,7 +1111,7 @@ async function handleWorktrunkAliasCommand(
       ? ""
       :
         "\n\nThe alias removed Pi's working directory. Use " +
-        "`/worktree continue <target>` to continue this session in an " +
+        "`/wt continue <target>` to continue this session in an " +
         "existing worktree.";
     ctx.ui.notify(rendered.text + recoveryHint, "info");
   } catch (error) {
@@ -1377,7 +1377,7 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  pi.registerCommand("worktree", {
+  pi.registerCommand("wt", {
     description: "Manage git worktrees with Worktrunk",
     getArgumentCompletions(argumentPrefix) {
       const prefix = argumentPrefix.trimStart();
@@ -1410,7 +1410,7 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: [
       "Use the worktree tool when the user asks to inspect or manage Worktrunk worktrees.",
       "Only use the worktree remove action when the user explicitly asks to remove a worktree.",
-      "The worktree tool returns target paths but cannot switch Pi's active session; use /worktree continue for an interactive session transition.",
+      "The worktree tool returns target paths but cannot switch Pi's active session; use /wt continue for an interactive session transition.",
     ],
     parameters: Type.Object(
       {

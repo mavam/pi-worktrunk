@@ -247,7 +247,7 @@ test("Worktrunk client exposes the supported lifecycle operations", async () => 
   ]);
 });
 
-test("/worktree create reports the path and keeps Pi in place", async () => {
+test("/wt create reports the path and keeps Pi in place", async () => {
   const notifications: Array<[string, string]> = [];
   const client = {
     async create(_cwd: string, branch: string) {
@@ -277,7 +277,7 @@ test("/worktree create reports the path and keeps Pi in place", async () => {
   ]);
 });
 
-test("/worktree create can continue the session in the new worktree", async () => {
+test("/wt create can continue the session in the new worktree", async () => {
   const continuationTargets: Array<{ branch: string | null; path: string }> = [];
   const client = {
     async create(_cwd: string, branch: string) {
@@ -327,7 +327,7 @@ test("missing working directories are not reported as missing Worktrunk", async 
   }
 });
 
-test("/worktree continue resolves an existing worktree", async () => {
+test("/wt continue resolves an existing worktree", async () => {
   const continuationTargets: Array<{ branch: string | null; path: string }> = [];
   const client = {
     async list() {
@@ -1043,7 +1043,7 @@ test("extension lazily discovers a worktree from stored repository identity", as
   }
 });
 
-test("extension exposes Worktrunk aliases under /worktree", async () => {
+test("extension exposes Worktrunk aliases under /wt", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-alias-test-"));
   const handlers = new Map<string, (...args: any[]) => Promise<void>>();
   const commands = new Map<string, any>();
@@ -1096,8 +1096,8 @@ test("extension exposes Worktrunk aliases under /worktree", async () => {
     };
     await handlers.get("session_start")?.({}, sessionContext);
 
-    assert.deepEqual([...commands.keys()], ["worktree"]);
-    const command = commands.get("worktree");
+    assert.deepEqual([...commands.keys()], ["wt"]);
+    const command = commands.get("wt");
     assert.deepEqual(command.getArgumentCompletions("la"), [
       { value: "land", label: "land" },
     ]);
@@ -1134,12 +1134,12 @@ test("extension exposes Worktrunk aliases under /worktree", async () => {
       cwd: root,
     });
     assert.equal(notifications[0]?.level, "info");
-    assert.match(notifications[0]?.message ?? "", /\/worktree land \[args\]/);
+    assert.match(notifications[0]?.message ?? "", /\/wt land \[args\]/);
     assert.deepEqual(notifications[1], {
       message:
         "Merged pull request 42\n✓ Removed feature worktree\n\n" +
         "The alias removed Pi's working directory. Use " +
-        "`/worktree continue <target>` to continue this session in an " +
+        "`/wt continue <target>` to continue this session in an " +
         "existing worktree.",
       level: "info",
     });
@@ -1148,7 +1148,7 @@ test("extension exposes Worktrunk aliases under /worktree", async () => {
   }
 });
 
-test("extension registers markers, /worktree, and the worktree tool", () => {
+test("extension registers markers, /wt, and the worktree tool", () => {
   const events: string[] = [];
   const commands: string[] = [];
   const tools: string[] = [];
@@ -1168,7 +1168,7 @@ test("extension registers markers, /worktree, and the worktree tool", () => {
     },
   } as any);
 
-  assert.deepEqual(commands, ["worktree"]);
+  assert.deepEqual(commands, ["wt"]);
   assert.deepEqual(tools, ["worktree"]);
   assert.deepEqual(events, [
     "session_start",

@@ -19,8 +19,8 @@ pi install npm:pi-worktrunk
 
 - Adds tiny traffic lights to `wt list` so you can see whether pi is working or
   waiting for you
-- Gives you a `/worktree` command for interactive worktree management
-- Exposes configured Worktrunk aliases as `/worktree` subcommands
+- Gives you a `/wt` command for interactive worktree management
+- Exposes configured Worktrunk aliases as `/wt` subcommands
 - Continues the current pi session in another worktree when you request it
 - Gives the model the same Worktrunk-backed controls through one `worktree` tool
 - Keeps Worktrunk as the source of truth, with no second layer of worktree magic
@@ -47,25 +47,25 @@ not a Worktrunk-managed repository.
 
 ## 🧭 Interactive commands
 
-Use `/worktree` to show the command reference.
+Use `/wt` to show the command reference.
 
 | Command | Behavior |
 | --- | --- |
-| `/worktree list` | Select and inspect a worktree from `wt list --format=json`. |
-| `/worktree create <branch>` | Create a branch and worktree with `wt switch --create --no-cd`. |
-| `/worktree create <branch> --continue` | Create a worktree and continue the current pi session there. |
-| `/worktree continue [target]` | Select or name a worktree in which to continue the current pi session. |
-| `/worktree remove [target]` | Remove a selected or named worktree; Worktrunk deletes its branch when safe. |
-| `/worktree status` | Show the current worktree and its local and remote state. |
-| `/worktree cd [target]` | Show the path for a branch, path, directory name, or the current worktree. |
-| `/worktree settings` | Show the active user and project configuration from `wt config show`. |
+| `/wt list` | Select and inspect a worktree from `wt list --format=json`. |
+| `/wt create <branch>` | Create a branch and worktree with `wt switch --create --no-cd`. |
+| `/wt create <branch> --continue` | Create a worktree and continue the current pi session there. |
+| `/wt continue [target]` | Select or name a worktree in which to continue the current pi session. |
+| `/wt remove [target]` | Remove a selected or named worktree; Worktrunk deletes its branch when safe. |
+| `/wt status` | Show the current worktree and its local and remote state. |
+| `/wt cd [target]` | Show the path for a branch, path, directory name, or the current worktree. |
+| `/wt settings` | Show the active user and project configuration from `wt config show`. |
 
 The command also supports `ls`, `rm`, and `config` as aliases for `list`,
 `remove`, and `settings`.
 
 ### 🏷️ Worktrunk aliases
 
-Configured Worktrunk aliases appear as `/worktree` subcommands. For example,
+Configured Worktrunk aliases appear as `/wt` subcommands. For example,
 this Worktrunk alias:
 
 ```toml
@@ -76,8 +76,8 @@ land = "gh pr merge --squash {{ args }}"
 becomes:
 
 ```text
-/worktree land
-/worktree land 42
+/wt land
+/wt land 42
 ```
 
 The extension discovers the effective aliases for the current repository when
@@ -86,12 +86,12 @@ Worktrunk without shell expansion, shows the command output in Pi, and preserves
 Worktrunk's approval checks for project aliases.
 
 An alias can remove the worktree in which Pi is running. If it does, use
-`/worktree continue <target>` to continue the session in an existing worktree.
+`/wt continue <target>` to continue the session in an existing worktree.
 
 ### 📍 Continue a session
 
-Use `/worktree continue [target]` to continue the current session in an existing
-worktree. Add `--continue` to `/worktree create <branch>` to create the worktree
+Use `/wt continue [target]` to continue the current session in an existing
+worktree. Add `--continue` to `/wt create <branch>` to create the worktree
 and continue there in one operation.
 
 Before switching, the extension shows the source and target directories and asks
@@ -123,7 +123,7 @@ native text output. Tool output is limited to 2,000 lines or 50 KB. The
 extension saves larger output to a temporary file and returns its path.
 
 The agent tool can create and resolve worktrees, but it can't switch the active
-pi session. Use `/worktree continue` for that user-confirmed transition.
+pi session. Use `/wt continue` for that user-confirmed transition.
 
 ## 🛡️ Safety
 
