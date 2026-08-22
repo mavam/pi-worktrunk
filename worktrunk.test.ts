@@ -1043,9 +1043,9 @@ test("extension lazily discovers a worktree from stored repository identity", as
   }
 });
 
-test("extension exposes Worktrunk aliases under /wt", async () => {
+test("extension exposes Worktrunk aliases under /wt and in the model prompt", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-alias-test-"));
-  const handlers = new Map<string, (...args: any[]) => Promise<void>>();
+  const handlers = new Map<string, (...args: any[]) => Promise<any>>();
   const commands = new Map<string, any>();
   const calls: Array<{ program: string; args: string[]; cwd?: string }> = [];
   const notifications: Array<{ message: string; level: string }> = [];
@@ -1102,10 +1102,22 @@ test("extension exposes Worktrunk aliases under /wt", async () => {
       { value: "land", label: "land" },
     ]);
     assert.deepEqual(command.getArgumentCompletions("wo"), []);
+    const prompt = await handlers.get("before_agent_start")?.({
+      systemPrompt: "Base prompt",
+    });
+    assert.match(prompt.systemPrompt, /^Base prompt/);
+    assert.match(prompt.systemPrompt, /`\/wt land \[args\]`/);
+    assert.doesNotMatch(prompt.systemPrompt, /`\/wt list \[args\]`/);
+    assert.match(prompt.systemPrompt, /suggest the exact slash command/);
+    assert.match(prompt.systemPrompt, /not agent tools/);
 
     helpFails = true;
     await handlers.get("session_start")?.({}, sessionContext);
     assert.deepEqual(command.getArgumentCompletions("la"), []);
+    assert.equal(
+      await handlers.get("before_agent_start")?.({ systemPrompt: "Base prompt" }),
+      undefined,
+    );
 
     helpFails = false;
     await handlers.get("session_start")?.({}, sessionContext);
@@ -1172,6 +1184,7 @@ test("extension registers markers, /wt, and the worktree tool", () => {
   assert.deepEqual(tools, ["worktree"]);
   assert.deepEqual(events, [
     "session_start",
+    "before_agent_start",
     "agent_start",
     "agent_end",
     "session_shutdown",

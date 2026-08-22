@@ -81,9 +81,13 @@ becomes:
 ```
 
 The extension discovers the effective aliases for the current repository when
-the session starts. It forwards quoted and escaped arguments directly to
-Worktrunk without shell expansion, shows the command output in Pi, and preserves
-Worktrunk's approval checks for project aliases.
+the session starts. It adds their names to the model's prompt, so the model can
+suggest the exact `/wt` command when an alias fits the task. Aliases remain
+user-invoked slash commands rather than agent tools.
+
+Pi forwards quoted and escaped arguments directly to Worktrunk without shell
+expansion, shows the command output, and preserves Worktrunk's approval checks
+for project aliases.
 
 An alias can remove the worktree in which Pi is running. If it does, use
 `/wt continue <target>` to continue the session in an existing worktree.

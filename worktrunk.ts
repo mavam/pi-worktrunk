@@ -1552,6 +1552,20 @@ export default function (pi: ExtensionAPI) {
     await discoverAliases(ctx);
     await tracker.markWaiting(ctx.cwd);
   });
+  pi.on("before_agent_start", (event) => {
+    if (worktrunkAliases.size === 0) return;
+    const commands = [...worktrunkAliases]
+      .map((alias) => `- \`/wt ${alias} [args]\``)
+      .join("\n");
+    return {
+      systemPrompt:
+        `${event.systemPrompt}\n\n## Worktrunk aliases\n\n` +
+        "The user can invoke these configured Worktrunk aliases as slash commands:\n\n" +
+        `${commands}\n\n` +
+        "When one fits the task, suggest the exact slash command to the user. " +
+        "These aliases are not agent tools, so do not try to invoke them through bash or the worktree tool.",
+    };
+  });
   pi.on("agent_start", (_event, ctx) => tracker.markWorking(ctx.cwd));
   pi.on("agent_end", (_event, ctx) => tracker.markWaiting(ctx.cwd));
   pi.on("session_shutdown", (_event, ctx) => tracker.clear(ctx.cwd));
