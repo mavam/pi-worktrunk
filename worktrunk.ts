@@ -1,7 +1,7 @@
 import { existsSync, statSync, writeFileSync } from "node:fs";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 import {
   DEFAULT_MAX_BYTES,
@@ -11,6 +11,7 @@ import {
   truncateHead,
   type ExtensionAPI,
   type ExtensionCommandContext,
+  type ExtensionContext,
   type SessionEntry,
   type SessionHeader,
 } from "@earendil-works/pi-coding-agent";
@@ -42,11 +43,13 @@ type WtResult = {
   stderr?: string;
   code: number;
   killed?: boolean;
+  relocated?: boolean;
 };
 
 type RunWtOptions = {
   cwd?: string;
   signal?: AbortSignal;
+  cwdMode?: "repository-read";
 };
 
 type RunWt = (args: string[], options?: RunWtOptions) => Promise<WtResult>;
@@ -403,12 +406,24 @@ function approvalHint(output: string): string {
   );
 }
 
-function formatWtFailure(args: string[], result: WtResult): string {
+function missingCwdMessage(cwd: string): string {
+  return (
+    `Pi's working directory no longer exists: ${cwd}. ` +
+    "Continue the session from an existing worktree or restart Pi there."
+  );
+}
+
+function formatWtFailure(
+  args: string[],
+  result: WtResult,
+  cwd: string,
+): string {
   const output = [result.stderr?.trim(), result.stdout?.trim()]
     .filter(Boolean)
     .join("\n");
 
   if (result.killed) return `wt ${args.join(" ")} was cancelled.`;
+  if (!existsSync(cwd)) return missingCwdMessage(cwd);
   if (!output || result.code === 127 || /\bENOENT\b/i.test(output)) {
     return (
       "Could not start Worktrunk (`wt`). Install Worktrunk 0.70 or later " +
@@ -424,19 +439,22 @@ export function createWorktrunkClient(runWt: RunWt) {
     args: string[],
     cwd: string,
     signal?: AbortSignal,
+    cwdMode?: "repository-read",
   ): Promise<WtResult> {
     let result: WtResult;
     try {
-      result = await runWt(args, { cwd, signal });
+      result = await runWt(args, { cwd, signal, cwdMode });
     } catch (error) {
       throw new WorktrunkError(
-        `Could not execute Worktrunk: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        !existsSync(cwd)
+          ? missingCwdMessage(cwd)
+          : `Could not execute Worktrunk: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
       );
     }
     if (result.code !== 0) {
-      throw new WorktrunkError(formatWtFailure(args, result));
+      throw new WorktrunkError(formatWtFailure(args, result, cwd));
     }
     return result;
   }
@@ -446,8 +464,15 @@ export function createWorktrunkClient(runWt: RunWt) {
       ["--config-set", "list.json-schema=2", "list", "--format=json"],
       cwd,
       signal,
+      "repository-read",
     );
-    return parseWorktreeList(result.stdout ?? "");
+    const worktrees = parseWorktreeList(result.stdout ?? "");
+    if (result.relocated) {
+      for (const item of worktrees) {
+        if (item.worktree) item.worktree.current = false;
+      }
+    }
+    return worktrees;
   }
 
   return {
@@ -460,7 +485,12 @@ export function createWorktrunkClient(runWt: RunWt) {
     },
 
     async listText(cwd: string, signal?: AbortSignal) {
-      const result = await run(["list"], cwd, signal);
+      const result = await run(
+        ["list"],
+        cwd,
+        signal,
+        "repository-read",
+      );
       const table = result.stdout?.trimEnd() ?? "";
       const summary = result.stderr?.trim() ?? "";
       return [table, summary].filter(Boolean).join("\n\n");
@@ -515,12 +545,18 @@ export function createWorktrunkClient(runWt: RunWt) {
         ["config", "show", "--format=json"],
         cwd,
         signal,
+        "repository-read",
       );
       return result.stdout?.trim() ?? "";
     },
 
     async settingsText(cwd: string, signal?: AbortSignal) {
-      const result = await run(["config", "show"], cwd, signal);
+      const result = await run(
+        ["config", "show"],
+        cwd,
+        signal,
+        "repository-read",
+      );
       return result.stdout?.trimEnd() ?? "";
     },
   };
@@ -813,6 +849,9 @@ async function commandStatus(
   client: WorktrunkClient,
 ): Promise<void> {
   requireNoArgs(args, "/worktree status");
+  if (!existsSync(ctx.cwd)) {
+    throw new WorktrunkError(missingCwdMessage(ctx.cwd));
+  }
   const current = await client.status(ctx.cwd);
   if (!current) {
     throw new WorktrunkError(
@@ -827,6 +866,9 @@ async function commandPath(
   ctx: ExtensionCommandContext,
   client: WorktrunkClient,
 ): Promise<void> {
+  if (!args && !existsSync(ctx.cwd)) {
+    throw new WorktrunkError(missingCwdMessage(ctx.cwd));
+  }
   const worktrees = await client.list(ctx.cwd);
   const target = args
     ? resolveWorktree(worktrees, args)
@@ -1023,10 +1065,151 @@ const WorktreeActionSchema = Type.Unsafe<WorktreeAction>({
   description: "The Worktrunk operation to perform.",
 });
 
+const REPOSITORY_IDENTITY_ENTRY = "pi-worktrunk-repository";
+
+type RepositoryIdentity = {
+  commonDir: string;
+  device: number;
+  inode: number;
+};
+
+function repositoryIdentity(commonDir: string): RepositoryIdentity | undefined {
+  try {
+    const stat = statSync(commonDir);
+    return { commonDir, device: stat.dev, inode: stat.ino };
+  } catch {
+    return undefined;
+  }
+}
+
+function sameRepositoryIdentity(
+  left: RepositoryIdentity | undefined,
+  right: RepositoryIdentity | undefined,
+): boolean {
+  return Boolean(
+    left &&
+      right &&
+      left.commonDir === right.commonDir &&
+      left.device === right.device &&
+      left.inode === right.inode,
+  );
+}
+
+function gitWorktreePaths(output: string): string[] {
+  return output
+    .split("\0")
+    .filter((field) => field.startsWith("worktree "))
+    .map((field) => field.slice("worktree ".length));
+}
+
 export default function (pi: ExtensionAPI) {
-  const runWt: RunWt = (args, options) => pi.exec("wt", args, options);
-  const tracker = createMarkerUpdater(runWt);
+  const execWt: RunWt = (args, options) => pi.exec("wt", args, options);
+  let storedRepositoryIdentity: RepositoryIdentity | undefined;
+
+  async function readCommonDir(
+    cwd: string,
+    signal?: AbortSignal,
+  ): Promise<string | undefined> {
+    if (!existsSync(cwd)) return undefined;
+    const result = await pi.exec(
+      "git",
+      ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+      { cwd, signal },
+    );
+    if (result.code !== 0 || !result.stdout.trim()) return undefined;
+    return resolve(cwd, result.stdout.trim());
+  }
+
+  async function findRepositoryWorktree(
+    signal?: AbortSignal,
+  ): Promise<string | undefined> {
+    const identity = storedRepositoryIdentity;
+    if (
+      !identity ||
+      !sameRepositoryIdentity(identity, repositoryIdentity(identity.commonDir))
+    ) {
+      return undefined;
+    }
+    const commonDir = identity.commonDir;
+    const result = await pi.exec(
+      "git",
+      ["--git-dir", commonDir, "worktree", "list", "--porcelain", "-z"],
+      { cwd: dirname(commonDir), signal },
+    );
+    if (result.code !== 0) return undefined;
+
+    for (const path of gitWorktreePaths(result.stdout)) {
+      if (!existsSync(path)) continue;
+      if ((await readCommonDir(path, signal)) === commonDir) return path;
+    }
+    return undefined;
+  }
+
+  const runWt: RunWt = async (args, options) => {
+    const { cwdMode, ...execOptions } = options ?? {};
+    const requestedCwd = execOptions.cwd;
+    if (
+      !requestedCwd ||
+      existsSync(requestedCwd) ||
+      cwdMode !== "repository-read"
+    ) {
+      return execWt(args, execOptions);
+    }
+    const fallbackCwd = await findRepositoryWorktree(execOptions.signal);
+    if (!fallbackCwd) return execWt(args, execOptions);
+    const result = await execWt(args, { ...execOptions, cwd: fallbackCwd });
+    return { ...result, relocated: true };
+  };
+  const tracker = createMarkerUpdater(execWt);
   const client = createWorktrunkClient(runWt);
+
+  async function restoreRepositoryIdentity(ctx: ExtensionContext) {
+    const stored = [...ctx.sessionManager.getEntries()]
+      .reverse()
+      .find(
+        (entry) =>
+          entry.type === "custom" &&
+          entry.customType === REPOSITORY_IDENTITY_ENTRY &&
+          typeof entry.data === "object" &&
+          entry.data !== null &&
+          "commonDir" in entry.data &&
+          typeof entry.data.commonDir === "string",
+      );
+    if (stored?.type === "custom") {
+      const data = stored.data as Partial<RepositoryIdentity>;
+      if (
+        typeof data.commonDir === "string" &&
+        typeof data.device === "number" &&
+        typeof data.inode === "number"
+      ) {
+        const identity = data as RepositoryIdentity;
+        if (
+          sameRepositoryIdentity(
+            identity,
+            repositoryIdentity(identity.commonDir),
+          )
+        ) {
+          storedRepositoryIdentity = identity;
+        }
+      }
+    }
+
+    try {
+      const commonDir = await readCommonDir(ctx.cwd);
+      if (!commonDir) return;
+      const identity = repositoryIdentity(commonDir);
+      if (
+        !identity ||
+        sameRepositoryIdentity(identity, storedRepositoryIdentity)
+      ) {
+        return;
+      }
+      storedRepositoryIdentity = identity;
+      pi.appendEntry(REPOSITORY_IDENTITY_ENTRY, identity);
+    } catch {
+      // A restored identity can still recover a session whose cwd is gone.
+    }
+  }
 
   pi.registerCommand("worktree", {
     description: "Manage git worktrees with Worktrunk",
@@ -1070,13 +1253,27 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       switch (params.action) {
         case "list": {
+          const currentDirectoryExists = existsSync(ctx.cwd);
           const worktrees = await client.list(ctx.cwd, signal);
-          const display = await tuiDisplay(ctx.mode, () =>
-            client.listText(ctx.cwd, signal),
+          const display = currentDirectoryExists
+            ? await tuiDisplay(ctx.mode, () =>
+                client.listText(ctx.cwd, signal),
+              )
+            : undefined;
+          return toolResult(
+            "list",
+            {
+              worktrees,
+              currentDirectory: ctx.cwd,
+              currentDirectoryExists,
+            },
+            display,
           );
-          return toolResult("list", { worktrees }, display);
         }
         case "status": {
+          if (!existsSync(ctx.cwd)) {
+            throw new WorktrunkError(missingCwdMessage(ctx.cwd));
+          }
           const current = await client.status(ctx.cwd, signal);
           if (!current) {
             throw new WorktrunkError(
@@ -1122,8 +1319,11 @@ export default function (pi: ExtensionAPI) {
           );
         }
         case "path": {
-          const worktrees = await client.list(ctx.cwd, signal);
           const ref = params.target?.trim();
+          if (!ref && !existsSync(ctx.cwd)) {
+            throw new WorktrunkError(missingCwdMessage(ctx.cwd));
+          }
+          const worktrees = await client.list(ctx.cwd, signal);
           const target = ref
             ? resolveWorktree(worktrees, ref)
             : worktrees.find((item) => item.worktree?.current);
@@ -1170,7 +1370,10 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.on("session_start", (_event, ctx) => tracker.markWaiting(ctx.cwd));
+  pi.on("session_start", async (_event, ctx) => {
+    await restoreRepositoryIdentity(ctx);
+    await tracker.markWaiting(ctx.cwd);
+  });
   pi.on("agent_start", (_event, ctx) => tracker.markWorking(ctx.cwd));
   pi.on("agent_end", (_event, ctx) => tracker.markWaiting(ctx.cwd));
   pi.on("session_shutdown", (_event, ctx) => tracker.clear(ctx.cwd));

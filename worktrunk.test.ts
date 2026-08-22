@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { existsSync, statSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -97,9 +97,17 @@ test("marker updates stop after Worktrunk becomes unavailable", async () => {
 });
 
 test("Worktrunk client exposes the supported lifecycle operations", async () => {
-  const calls: Array<{ args: string[]; cwd?: string }> = [];
+  const calls: Array<{
+    args: string[];
+    cwd?: string;
+    cwdMode?: "repository-read";
+  }> = [];
   const client = createWorktrunkClient(async (args, options) => {
-    calls.push({ args: [...args], cwd: options?.cwd });
+    calls.push({
+      args: [...args],
+      cwd: options?.cwd,
+      ...(options?.cwdMode ? { cwdMode: options.cwdMode } : {}),
+    });
     if (args.length === 1 && args[0] === "list") {
       return { code: 0, stdout: "@ main  ^|" };
     }
@@ -174,10 +182,12 @@ test("Worktrunk client exposes the supported lifecycle operations", async () => 
         "--format=json",
       ],
       cwd: "/repo",
+      cwdMode: "repository-read",
     },
     {
       args: ["list"],
       cwd: "/repo",
+      cwdMode: "repository-read",
     },
     {
       args: [
@@ -196,10 +206,12 @@ test("Worktrunk client exposes the supported lifecycle operations", async () => 
     {
       args: ["config", "show", "--format=json"],
       cwd: "/repo",
+      cwdMode: "repository-read",
     },
     {
       args: ["config", "show"],
       cwd: "/repo",
+      cwdMode: "repository-read",
     },
   ]);
 });
@@ -261,6 +273,29 @@ test("/worktree create can continue the session in the new worktree", async () =
   ]);
 });
 
+test("missing working directories are not reported as missing Worktrunk", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-test-"));
+  const missing = join(root, "removed-worktree");
+  const client = createWorktrunkClient(async () => ({
+    code: -1,
+    stderr: "spawn wt ENOENT",
+  }));
+
+  try {
+    await assert.rejects(
+      client.list(missing),
+      (error: Error) => {
+        assert.match(error.message, /working directory no longer exists/);
+        assert.match(error.message, new RegExp(missing));
+        assert.doesNotMatch(error.message, /Install Worktrunk/);
+        return true;
+      },
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("/worktree continue resolves an existing worktree", async () => {
   const continuationTargets: Array<{ branch: string | null; path: string }> = [];
   const client = {
@@ -286,6 +321,52 @@ test("/worktree continue resolves an existing worktree", async () => {
   assert.deepEqual(continuationTargets, [
     { branch: "feature/auth", path: "/repo.feature-auth" },
   ]);
+});
+
+test("relocated lists do not claim the fallback is Pi's current worktree", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-test-"));
+  const main = join(root, "repo");
+  const removed = join(root, "repo.deleted");
+  await mkdir(main);
+  const continuationTargets: Array<{ branch: string | null; path: string }> = [];
+  const list = JSON.stringify({
+    schema: 2,
+    items: [
+      { branch: "main", worktree: { path: main, main: true, current: true } },
+    ],
+  });
+  const client = createWorktrunkClient(async () => ({
+    code: 0,
+    stdout: list,
+    relocated: true,
+  }));
+
+  try {
+    await handleWorktreeCommand(
+      "continue",
+      {
+        cwd: removed,
+        hasUI: true,
+        ui: {
+          async select(_title: string, options: string[]) {
+            assert.equal(options.length, 1);
+            return options[0];
+          },
+          notify() {},
+        },
+      } as any,
+      client,
+      async (_ctx, target) => {
+        continuationTargets.push(target);
+        return true;
+      },
+    );
+
+    assert.deepEqual(continuationTargets, [{ branch: "main", path: main }]);
+    assert.equal((await client.list(removed))[0].worktree?.current, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("session continuation forks, switches, and records the cwd transition", async () => {
@@ -713,7 +794,7 @@ test("worktree tool renders native output for every action", async () => {
       params,
       new AbortController().signal,
       undefined,
-      { cwd: "/repo", mode: "tui" },
+      { cwd: process.cwd(), mode: "tui" },
     );
 
   const list = await execute({ action: "list" });
@@ -765,6 +846,151 @@ test("worktree tool renders native output for every action", async () => {
     calls.some((args) =>
       args.join(" ") === "config show"),
   );
+});
+
+test("extension stores repository identity without listing worktrees at startup", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-test-"));
+  const source = join(root, "repo.feature");
+  const commonDir = join(root, "repo", ".git");
+  await mkdir(source);
+  await mkdir(commonDir, { recursive: true });
+  const handlers = new Map<string, (...args: any[]) => Promise<void>>();
+  const entries: Array<{ customType: string; data: unknown }> = [];
+  const calls: Array<{ program: string; args: string[] }> = [];
+
+  try {
+    extension({
+      on(event: string, handler: (...args: any[]) => Promise<void>) {
+        handlers.set(event, handler);
+      },
+      registerCommand() {},
+      registerTool() {},
+      appendEntry(customType: string, data: unknown) {
+        entries.push({ customType, data });
+      },
+      async exec(program: string, args: string[]) {
+        calls.push({ program, args: [...args] });
+        if (program === "git") {
+          return {
+            code: 0,
+            stdout: `${commonDir}\n`,
+            stderr: "",
+            killed: false,
+          };
+        }
+        return { code: 0, stdout: "", stderr: "", killed: false };
+      },
+    } as any);
+
+    await handlers.get("session_start")?.({}, {
+      cwd: source,
+      sessionManager: { getEntries: () => [] },
+    });
+
+    const commonDirStat = statSync(commonDir);
+    assert.deepEqual(entries, [
+      {
+        customType: "pi-worktrunk-repository",
+        data: {
+          commonDir,
+          device: commonDirStat.dev,
+          inode: commonDirStat.ino,
+        },
+      },
+    ]);
+    assert.equal(
+      calls.some(({ program, args }) =>
+        program === "wt" && args.includes("list"),
+      ),
+      false,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("extension lazily discovers a worktree from stored repository identity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-test-"));
+  const main = join(root, "repo");
+  const commonDir = join(main, ".git");
+  const source = join(root, "repo.feature");
+  await mkdir(commonDir, { recursive: true });
+
+  const handlers = new Map<string, (...args: any[]) => Promise<void>>();
+  let command: any;
+  const calls: Array<{ program: string; args: string[]; cwd?: string }> = [];
+  const list = JSON.stringify({
+    schema: 2,
+    items: [
+      { branch: "main", worktree: { path: main, main: true, current: true } },
+    ],
+  });
+
+  try {
+    extension({
+      on(event: string, handler: (...args: any[]) => Promise<void>) {
+        handlers.set(event, handler);
+      },
+      registerCommand(_name: string, definition: any) {
+        command = definition;
+      },
+      registerTool() {},
+      appendEntry() {
+        throw new Error("stored identity should not be appended again");
+      },
+      async exec(program: string, args: string[], options: { cwd?: string }) {
+        calls.push({ program, args: [...args], cwd: options.cwd });
+        if (program === "git" && args.includes("worktree")) {
+          return {
+            code: 0,
+            stdout: `worktree ${main}\0HEAD aaaa\0branch refs/heads/main\0\0`,
+            stderr: "",
+            killed: false,
+          };
+        }
+        if (program === "git") {
+          return {
+            code: 0,
+            stdout: `${commonDir}\n`,
+            stderr: "",
+            killed: false,
+          };
+        }
+        if (args.includes("list")) {
+          return { code: 0, stdout: list, stderr: "", killed: false };
+        }
+        return { code: 0, stdout: "", stderr: "", killed: false };
+      },
+    } as any);
+
+    const commonDirStat = statSync(commonDir);
+    const identityEntry = {
+      type: "custom",
+      customType: "pi-worktrunk-repository",
+      data: {
+        commonDir,
+        device: commonDirStat.dev,
+        inode: commonDirStat.ino,
+      },
+    };
+    await handlers.get("session_start")?.({}, {
+      cwd: source,
+      sessionManager: { getEntries: () => [identityEntry] },
+    });
+    await handlers.get("agent_end")?.({}, { cwd: source });
+    assert.equal(calls.at(-1)?.cwd, source);
+
+    await command.handler("list", {
+      cwd: source,
+      hasUI: false,
+      ui: { notify() {} },
+    });
+
+    assert.equal(calls.at(-1)?.program, "wt");
+    assert.equal(calls.at(-1)?.cwd, main);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("extension registers markers, /worktree, and the worktree tool", () => {
