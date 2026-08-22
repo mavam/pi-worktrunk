@@ -1533,7 +1533,7 @@ export default function (pi: ExtensionAPI) {
     renderCall(args, theme) {
       let text =
         theme.fg("toolTitle", theme.bold("Worktrunk")) +
-        ` › ${args.action}`;
+        ` › ${theme.bold(args.action)}`;
       const operand = args.branch ?? args.target;
       if (operand) text += ` ${theme.fg("accent", operand)}`;
       return new Text(text, 0, 0);

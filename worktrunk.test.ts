@@ -840,11 +840,11 @@ test("worktree tool renders native output for every action", async () => {
       )
       .render(120)[0]
       .trimEnd(),
-    "<toolTitle><bold>Worktrunk</bold></toolTitle> › create <accent>feature/new</accent>",
+    "<toolTitle><bold>Worktrunk</bold></toolTitle> › <bold>create</bold> <accent>feature/new</accent>",
   );
   assert.equal(
     tool.renderCall({ action: "list" }, theme).render(120)[0].trimEnd(),
-    "<toolTitle><bold>Worktrunk</bold></toolTitle> › list",
+    "<toolTitle><bold>Worktrunk</bold></toolTitle> › <bold>list</bold>",
   );
 
   const list = await execute({ action: "list" });
