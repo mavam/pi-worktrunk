@@ -3,6 +3,8 @@ title: Slash commands for Worktrunk aliases
 type: feature
 authors:
   - mavam
+prs:
+  - 7
 created: 2026-08-22T07:34:19.367321Z
 ---
 
