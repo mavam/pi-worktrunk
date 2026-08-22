@@ -18,6 +18,7 @@ import extension, {
   markerArgs,
   materializeSessionSnapshot,
   parseAliasArguments,
+  parseWorktrunkAliasMetadata,
   parseWorktrunkAliasNames,
 } from "./worktrunk.ts";
 
@@ -85,6 +86,42 @@ Run wt config alias show for the full definitions.
   assert.deepEqual(parseWorktrunkAliasNames(output), ["deploy", "land"]);
   assert.deepEqual(parseWorktrunkAliasNames("Aliases:\n  land\n"), ["land"]);
   assert.deepEqual(parseWorktrunkAliasNames("wt help without aliases"), []);
+});
+
+test("Worktrunk alias metadata exposes pipeline step names", () => {
+  const config = JSON.stringify({
+    user: {
+      config: {
+        aliases: {
+          land: [
+            { "merge-pr": "gh pr merge" },
+            { verify: "gh pr view" },
+          ],
+        },
+      },
+    },
+    project: {
+      config: {
+        aliases: {
+          land: [{ cleanup: "wt remove" }],
+          deploy: "make deploy",
+          unrelated: [{ ignore: "true" }],
+        },
+      },
+    },
+  });
+
+  assert.deepEqual(
+    parseWorktrunkAliasMetadata(["land", "deploy", "missing"], config),
+    [
+      { name: "land", steps: ["merge-pr", "verify", "cleanup"] },
+      { name: "deploy", steps: [] },
+      { name: "missing", steps: [] },
+    ],
+  );
+  assert.deepEqual(parseWorktrunkAliasMetadata(["land"], "not json"), [
+    { name: "land", steps: [] },
+  ]);
 });
 
 test("alias arguments preserve quoting and escaping", () => {
@@ -1043,13 +1080,11 @@ test("extension lazily discovers a worktree from stored repository identity", as
   }
 });
 
-test("extension exposes Worktrunk aliases under /wt and in the model prompt", async () => {
+test("extension exposes Worktrunk aliases under /wt and as an agent tool", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-alias-test-"));
-  const handlers = new Map<
-    string,
-    (...args: any[]) => Promise<unknown> | unknown
-  >();
+  const handlers = new Map<string, (...args: any[]) => Promise<void>>();
   const commands = new Map<string, any>();
+  const tools = new Map<string, any>();
   const calls: Array<{ program: string; args: string[]; cwd?: string }> = [];
   const notifications: Array<{ message: string; level: string }> = [];
   let helpFails = false;
@@ -1062,7 +1097,9 @@ test("extension exposes Worktrunk aliases under /wt and in the model prompt", as
       registerCommand(name: string, definition: any) {
         commands.set(name, definition);
       },
-      registerTool() {},
+      registerTool(definition: any) {
+        tools.set(definition.name, definition);
+      },
       appendEntry() {},
       async exec(program: string, args: string[], options?: { cwd?: string }) {
         calls.push({ program, args: [...args], cwd: options?.cwd });
@@ -1080,8 +1117,31 @@ test("extension exposes Worktrunk aliases under /wt and in the model prompt", as
                 killed: false,
               };
         }
+        if (args[0] === "config" && args.includes("--format=json")) {
+          return {
+            code: 0,
+            stdout: JSON.stringify({
+              user: {
+                config: {
+                  aliases: {
+                    land: [
+                      { "merge-pr": "gh pr merge" },
+                      { verify: "gh pr view" },
+                      { "sync-main": "git fetch" },
+                      { cleanup: "wt remove" },
+                    ],
+                  },
+                },
+              },
+            }),
+            stderr: "",
+            killed: false,
+          };
+        }
         if (args[0] === "land") {
-          await rm(root, { recursive: true, force: true });
+          if (args.length > 1) {
+            await rm(root, { recursive: true, force: true });
+          }
           return {
             code: 0,
             stdout: "Merged pull request 42",
@@ -1095,38 +1155,57 @@ test("extension exposes Worktrunk aliases under /wt and in the model prompt", as
 
     const sessionContext = {
       cwd: root,
+      signal: undefined,
       sessionManager: { getEntries: () => [] },
     };
     await handlers.get("session_start")?.({}, sessionContext);
 
     assert.deepEqual([...commands.keys()], ["wt"]);
+    assert.deepEqual([...tools.keys()], ["worktree", "worktree_alias"]);
     const command = commands.get("wt");
     assert.deepEqual(command.getArgumentCompletions("la"), [
       { value: "land", label: "land" },
     ]);
     assert.deepEqual(command.getArgumentCompletions("wo"), []);
-    const prompt = await handlers.get("before_agent_start")?.({
-      systemPrompt: "Base prompt",
-    });
-    assert.ok(
-      prompt &&
-        typeof prompt === "object" &&
-        "systemPrompt" in prompt &&
-        typeof prompt.systemPrompt === "string",
+
+    const aliasTool = tools.get("worktree_alias");
+    assert.match(
+      aliasTool.description,
+      /land: merge-pr -> verify -> sync-main -> cleanup/,
     );
-    assert.match(prompt.systemPrompt, /^Base prompt/);
-    assert.match(prompt.systemPrompt, /`\/wt land \[args\]`/);
-    assert.doesNotMatch(prompt.systemPrompt, /`\/wt list \[args\]`/);
-    assert.match(prompt.systemPrompt, /suggest the exact slash command/);
-    assert.match(prompt.systemPrompt, /not agent tools/);
+    assert.deepEqual(aliasTool.parameters.properties.alias.enum, ["land"]);
+    const toolResult = await aliasTool.execute(
+      "call-land",
+      { alias: "land", args: [] },
+      new AbortController().signal,
+      undefined,
+      { cwd: root },
+    );
+    assert.deepEqual(calls.at(-1), {
+      program: "wt",
+      args: ["land"],
+      cwd: root,
+    });
+    assert.match(toolResult.content[0].text, /Merged pull request 42/);
+    assert.deepEqual(toolResult.details, {
+      alias: "land",
+      args: [],
+      truncated: false,
+    });
+    await assert.rejects(
+      aliasTool.execute(
+        "call-unknown",
+        { alias: "deploy", args: [] },
+        new AbortController().signal,
+        undefined,
+        { cwd: root },
+      ),
+      /Worktrunk alias not available: deploy/,
+    );
 
     helpFails = true;
     await handlers.get("session_start")?.({}, sessionContext);
     assert.deepEqual(command.getArgumentCompletions("la"), []);
-    assert.equal(
-      await handlers.get("before_agent_start")?.({ systemPrompt: "Base prompt" }),
-      undefined,
-    );
 
     helpFails = false;
     await handlers.get("session_start")?.({}, sessionContext);
@@ -1193,7 +1272,6 @@ test("extension registers markers, /wt, and the worktree tool", () => {
   assert.deepEqual(tools, ["worktree"]);
   assert.deepEqual(events, [
     "session_start",
-    "before_agent_start",
     "agent_start",
     "agent_end",
     "session_shutdown",

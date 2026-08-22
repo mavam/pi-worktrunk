@@ -20,9 +20,9 @@ pi install npm:pi-worktrunk
 - Adds tiny traffic lights to `wt list` so you can see whether pi is working or
   waiting for you
 - Gives you a `/wt` command for interactive worktree management
-- Exposes configured Worktrunk aliases as `/wt` subcommands
+- Exposes configured Worktrunk aliases as `/wt` subcommands and an agent tool
 - Continues the current pi session in another worktree when you request it
-- Gives the model the same Worktrunk-backed controls through one `worktree` tool
+- Gives the model Worktrunk-backed controls through dedicated agent tools
 - Keeps Worktrunk as the source of truth, with no second layer of worktree magic
 
 ## 🚦 Status markers
@@ -81,13 +81,14 @@ becomes:
 ```
 
 The extension discovers the effective aliases for the current repository when
-the session starts. It adds their names to the model's prompt, so the model can
-suggest the exact `/wt` command when an alias fits the task. Aliases remain
-user-invoked slash commands rather than agent tools.
+the session starts. When aliases exist, it registers a `worktree_alias` agent
+tool that lists their names and pipeline step labels. This lets you ask the
+agent to "land this PR" and have it run the configured `land` alias.
 
-Pi forwards quoted and escaped arguments directly to Worktrunk without shell
-expansion, shows the command output, and preserves Worktrunk's approval checks
-for project aliases.
+The model sees step labels such as `merge-pr`, `verify`, `sync-main`, and
+`cleanup`, but not the aliases' shell templates. Pi forwards arguments directly
+to Worktrunk without shell expansion, shows the command output, and preserves
+Worktrunk's approval checks for project aliases.
 
 An alias can remove the worktree in which Pi is running. If it does, use
 `/wt continue <target>` to continue the session in an existing worktree.
@@ -129,6 +130,18 @@ extension saves larger output to a temporary file and returns its path.
 The agent tool can create and resolve worktrees, but it can't switch the active
 pi session. Use `/wt continue` for that user-confirmed transition.
 
+When Worktrunk aliases are configured, the extension also registers
+`worktree_alias`:
+
+| Parameter | Required | Behavior |
+| --- | --- | --- |
+| `alias` | Yes | Select a discovered alias such as `land`. |
+| `args` | No | Pass arguments directly to Worktrunk without shell expansion. |
+
+The agent may call this tool only when you explicitly request an action that
+matches an alias. Alias pipelines can merge, deploy, publish, remove worktrees,
+or perform other external actions.
+
 ## 🛡️ Safety
 
 The extension delegates lifecycle decisions to Worktrunk:
@@ -138,9 +151,11 @@ The extension delegates lifecycle decisions to Worktrunk:
 - Worktrunk rejects dirty worktrees and retains branches that aren't integrated
   unless you run an explicit Worktrunk command with the corresponding force
   option.
-- Project hooks retain Worktrunk's approval gate. If a command reports that a
-  hook needs approval, run `wt config approvals add` in a terminal, review the
-  commands, and retry.
+- Project hooks and aliases retain Worktrunk's approval gate. If a command
+  reports that it needs approval, run `wt config approvals add` in a terminal,
+  review the commands, and retry.
+- The agent runs a Worktrunk alias only after you explicitly request a matching
+  action. It doesn't treat aliases as automatic workflow steps.
 - Session continuation requires confirmation, preserves the source session, and
   doesn't rewrite historical messages.
 

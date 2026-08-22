@@ -147,6 +147,18 @@ type ToolOutputDetails = {
   displayFullOutputPath?: string;
 };
 
+export type WorktrunkAlias = {
+  name: string;
+  steps: string[];
+};
+
+type AliasToolOutputDetails = {
+  alias: string;
+  args: string[];
+  truncated: boolean;
+  fullOutputPath?: string;
+};
+
 export function markerArgs(marker?: string): string[] {
   return marker === undefined
     ? ["config", "state", "marker", "clear"]
@@ -700,6 +712,54 @@ export function parseWorktrunkAliasNames(output: string): string[] {
   return aliases;
 }
 
+function aliasStepNames(value: unknown): string[] {
+  const entries = Array.isArray(value) ? value : [value];
+  const steps: string[] = [];
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    for (const name of Object.keys(entry)) {
+      if (WORKTRUNK_ALIAS_NAME.test(name) && !steps.includes(name)) {
+        steps.push(name);
+      }
+    }
+  }
+  return steps;
+}
+
+export function parseWorktrunkAliasMetadata(
+  names: readonly string[],
+  configOutput: string,
+): WorktrunkAlias[] {
+  const aliases = new Map(
+    names.map((name) => [name, { name, steps: [] as string[] }]),
+  );
+  let config: unknown;
+  try {
+    config = JSON.parse(configOutput);
+  } catch {
+    return [...aliases.values()];
+  }
+  if (!config || typeof config !== "object") return [...aliases.values()];
+
+  for (const source of ["user", "project"] as const) {
+    const layer = (config as Record<string, unknown>)[source];
+    if (!layer || typeof layer !== "object") continue;
+    const layerConfig = (layer as Record<string, unknown>).config;
+    if (!layerConfig || typeof layerConfig !== "object") continue;
+    const configuredAliases = (layerConfig as Record<string, unknown>).aliases;
+    if (!configuredAliases || typeof configuredAliases !== "object") continue;
+
+    for (const [name, value] of Object.entries(configuredAliases)) {
+      const alias = aliases.get(name);
+      if (!alias) continue;
+      for (const step of aliasStepNames(value)) {
+        if (!alias.steps.includes(step)) alias.steps.push(step);
+      }
+    }
+  }
+  return [...aliases.values()];
+}
+
 export function parseAliasArguments(input: string): string[] {
   const args: string[] = [];
   let current = "";
@@ -1071,6 +1131,48 @@ async function formatToolOutput(
   };
 }
 
+async function runWorktrunkAlias(
+  alias: string,
+  args: string[],
+  cwd: string,
+  signal: AbortSignal | undefined,
+  runWt: RunWt,
+) {
+  let result: WtResult;
+  try {
+    result = await runWt([alias, ...args], { cwd, signal });
+  } catch (error) {
+    throw new WorktrunkError(
+      !existsSync(cwd)
+        ? missingCwdMessage(cwd)
+        : `Could not execute Worktrunk: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+    );
+  }
+  if (result.code !== 0 || result.killed) {
+    throw new WorktrunkError(formatWtFailure([alias, ...args], result, cwd));
+  }
+
+  const output = [result.stdout?.trimEnd(), result.stderr?.trimEnd()]
+    .filter(Boolean)
+    .join("\n");
+  const rendered = await formatToolOutput(
+    `alias-${alias}`,
+    output || `wt ${alias} completed.`,
+  );
+  return { ...rendered, cwdExists: existsSync(cwd) };
+}
+
+function aliasRecoveryHint(cwdExists: boolean): string {
+  return cwdExists
+    ? ""
+    :
+      "\n\nThe alias removed Pi's working directory. Use " +
+      "`/wt continue <target>` to continue this session in an " +
+      "existing worktree.";
+}
+
 async function handleWorktrunkAliasCommand(
   alias: string,
   input: string,
@@ -1078,42 +1180,14 @@ async function handleWorktrunkAliasCommand(
   runWt: RunWt,
 ): Promise<void> {
   try {
-    const args = parseAliasArguments(input);
-    let result: WtResult;
-    try {
-      result = await runWt([alias, ...args], {
-        cwd: ctx.cwd,
-        signal: ctx.signal,
-      });
-    } catch (error) {
-      throw new WorktrunkError(
-        !existsSync(ctx.cwd)
-          ? missingCwdMessage(ctx.cwd)
-          : `Could not execute Worktrunk: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
-      );
-    }
-    if (result.code !== 0 || result.killed) {
-      throw new WorktrunkError(
-        formatWtFailure([alias, ...args], result, ctx.cwd),
-      );
-    }
-
-    const output = [result.stdout?.trimEnd(), result.stderr?.trimEnd()]
-      .filter(Boolean)
-      .join("\n");
-    const rendered = await formatToolOutput(
-      `alias-${alias}`,
-      output || `wt ${alias} completed.`,
+    const result = await runWorktrunkAlias(
+      alias,
+      parseAliasArguments(input),
+      ctx.cwd,
+      ctx.signal,
+      runWt,
     );
-    const recoveryHint = existsSync(ctx.cwd)
-      ? ""
-      :
-        "\n\nThe alias removed Pi's working directory. Use " +
-        "`/wt continue <target>` to continue this session in an " +
-        "existing worktree.";
-    ctx.ui.notify(rendered.text + recoveryHint, "info");
+    ctx.ui.notify(result.text + aliasRecoveryHint(result.cwdExists), "info");
   } catch (error) {
     ctx.ui.notify(
       error instanceof Error ? error.message : String(error),
@@ -1310,9 +1384,11 @@ export default function (pi: ExtensionAPI) {
   const tracker = createMarkerUpdater(execWt);
   const client = createWorktrunkClient(runWt);
   const worktrunkAliases = new Set<string>();
+  let worktrunkAliasMetadata: WorktrunkAlias[] = [];
 
   async function discoverAliases(ctx: ExtensionContext) {
     worktrunkAliases.clear();
+    worktrunkAliasMetadata = [];
     let result: WtResult;
     try {
       result = await runWt(["--help"], {
@@ -1327,6 +1403,112 @@ export default function (pi: ExtensionAPI) {
     for (const alias of parseWorktrunkAliasNames(result.stdout ?? "")) {
       if (!RESERVED_SUBCOMMANDS.has(alias)) worktrunkAliases.add(alias);
     }
+    if (worktrunkAliases.size === 0) return;
+    worktrunkAliasMetadata = [...worktrunkAliases].map((name) => ({
+      name,
+      steps: [],
+    }));
+    try {
+      worktrunkAliasMetadata = parseWorktrunkAliasMetadata(
+        [...worktrunkAliases],
+        await client.settings(ctx.cwd, ctx.signal),
+      );
+    } catch {
+      // Alias names are still useful when structured configuration is unavailable.
+    }
+  }
+
+  function registerWorktrunkAliasTool() {
+    if (worktrunkAliasMetadata.length === 0) return;
+    const catalog = worktrunkAliasMetadata
+      .map(({ name, steps }) =>
+        steps.length > 0
+          ? `- ${name}: ${steps.join(" -> ")}`
+          : `- ${name}`,
+      )
+      .join("\n");
+    const aliasNames = worktrunkAliasMetadata.map(({ name }) => name);
+    const AliasNameSchema = Type.Unsafe<string>({
+      type: "string",
+      enum: aliasNames,
+      description: `Configured Worktrunk alias to run. Available aliases:\n${catalog}`,
+    });
+
+    pi.registerTool({
+      name: "worktree_alias",
+      label: "Worktrunk Alias",
+      description:
+        "Run a configured Worktrunk alias. Alias pipelines may merge, deploy, " +
+        "publish, remove worktrees, or perform other external actions, so use " +
+        "this tool only when the user explicitly requests an action that matches " +
+        `one of these aliases:\n${catalog}`,
+      promptSnippet: `Run explicitly requested Worktrunk aliases: ${aliasNames.join(", ")}`,
+      promptGuidelines: [
+        "Use worktree_alias when the user explicitly requests an action that matches a configured Worktrunk alias.",
+        "Do not call worktree_alias based only on an inferred next step; aliases may perform destructive or external actions.",
+      ],
+      parameters: Type.Object(
+        {
+          alias: AliasNameSchema,
+          args: Type.Optional(
+            Type.Array(
+              Type.String({
+                description:
+                  "One argument passed directly to the alias without shell expansion.",
+              }),
+              { description: "Arguments passed directly to the alias." },
+            ),
+          ),
+        },
+        { additionalProperties: false },
+      ),
+      executionMode: "sequential",
+      async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+        const alias = params.alias.trim();
+        if (!worktrunkAliases.has(alias)) {
+          throw new WorktrunkError(
+            `Worktrunk alias not available: ${alias || "(empty)"}. ` +
+              `Available aliases: ${aliasNames.join(", ")}.`,
+          );
+        }
+        const args = params.args ?? [];
+        const result = await runWorktrunkAlias(
+          alias,
+          args,
+          ctx.cwd,
+          signal,
+          runWt,
+        );
+        const details: AliasToolOutputDetails = {
+          alias,
+          args,
+          truncated: result.truncated,
+          ...(result.fullOutputPath
+            ? { fullOutputPath: result.fullOutputPath }
+            : {}),
+        };
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: result.text + aliasRecoveryHint(result.cwdExists),
+            },
+          ],
+          details,
+        };
+      },
+      renderCall(args, theme) {
+        let text = theme.fg("toolTitle", theme.bold("Worktrunk Alias"));
+        if (args.alias) text += ` › ${theme.fg("accent", args.alias)}`;
+        if (args.args?.length) {
+          text += ` ${theme.fg("muted", args.args.join(" "))}`;
+        }
+        return new Text(text, 0, 0);
+      },
+      renderResult(result) {
+        return new Text(resultText(result), 0, 0);
+      },
+    });
   }
 
   async function restoreRepositoryIdentity(ctx: ExtensionContext) {
@@ -1550,25 +1732,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     await restoreRepositoryIdentity(ctx);
     await discoverAliases(ctx);
+    registerWorktrunkAliasTool();
     await tracker.markWaiting(ctx.cwd);
-  });
-  pi.on("before_agent_start", (event) => {
-    if (worktrunkAliases.size === 0) return;
-    const commands = [...worktrunkAliases]
-      .map((alias) => `- \`/wt ${alias} [args]\``)
-      .join("\n");
-    return {
-      systemPrompt: `${event.systemPrompt}
-
-## Worktrunk aliases
-
-The user can invoke these configured Worktrunk aliases as slash commands:
-
-${commands}
-
-When one fits the task, suggest the exact slash command to the user.
-These aliases are not agent tools, so do not try to invoke them through bash or the worktree tool.`,
-    };
   });
   pi.on("agent_start", (_event, ctx) => tracker.markWorking(ctx.cwd));
   pi.on("agent_end", (_event, ctx) => tracker.markWaiting(ctx.cwd));
