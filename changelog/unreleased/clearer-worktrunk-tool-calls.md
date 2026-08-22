@@ -3,6 +3,8 @@ title: Clearer Worktrunk tool calls
 type: change
 authors:
   - mavam
+prs:
+  - 6
 created: 2026-08-22T07:20:16.465546Z
 ---
 
