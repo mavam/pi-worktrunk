@@ -716,6 +716,25 @@ test("worktree tool renders native output for every action", async () => {
       { cwd: "/repo", mode: "tui" },
     );
 
+  const theme = {
+    bold: (text: string) => `<bold>${text}</bold>`,
+    fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
+  };
+  assert.equal(
+    tool
+      .renderCall(
+        { action: "create", branch: "feature/new" },
+        theme,
+      )
+      .render(120)[0]
+      .trimEnd(),
+    "<toolTitle><bold>Worktrunk</bold></toolTitle> › create <accent>feature/new</accent>",
+  );
+  assert.equal(
+    tool.renderCall({ action: "list" }, theme).render(120)[0].trimEnd(),
+    "<toolTitle><bold>Worktrunk</bold></toolTitle> › list",
+  );
+
   const list = await execute({ action: "list" });
   assert.match(list.content[0].text, /"worktrees"/);
   assert.equal(list.details.display, nativeList);
