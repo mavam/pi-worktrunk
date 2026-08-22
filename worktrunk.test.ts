@@ -1045,7 +1045,10 @@ test("extension lazily discovers a worktree from stored repository identity", as
 
 test("extension exposes Worktrunk aliases under /wt and in the model prompt", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-alias-test-"));
-  const handlers = new Map<string, (...args: any[]) => Promise<any>>();
+  const handlers = new Map<
+    string,
+    (...args: any[]) => Promise<unknown> | unknown
+  >();
   const commands = new Map<string, any>();
   const calls: Array<{ program: string; args: string[]; cwd?: string }> = [];
   const notifications: Array<{ message: string; level: string }> = [];
@@ -1105,6 +1108,12 @@ test("extension exposes Worktrunk aliases under /wt and in the model prompt", as
     const prompt = await handlers.get("before_agent_start")?.({
       systemPrompt: "Base prompt",
     });
+    assert.ok(
+      prompt &&
+        typeof prompt === "object" &&
+        "systemPrompt" in prompt &&
+        typeof prompt.systemPrompt === "string",
+    );
     assert.match(prompt.systemPrompt, /^Base prompt/);
     assert.match(prompt.systemPrompt, /`\/wt land \[args\]`/);
     assert.doesNotMatch(prompt.systemPrompt, /`\/wt list \[args\]`/);

@@ -1558,12 +1558,16 @@ export default function (pi: ExtensionAPI) {
       .map((alias) => `- \`/wt ${alias} [args]\``)
       .join("\n");
     return {
-      systemPrompt:
-        `${event.systemPrompt}\n\n## Worktrunk aliases\n\n` +
-        "The user can invoke these configured Worktrunk aliases as slash commands:\n\n" +
-        `${commands}\n\n` +
-        "When one fits the task, suggest the exact slash command to the user. " +
-        "These aliases are not agent tools, so do not try to invoke them through bash or the worktree tool.",
+      systemPrompt: `${event.systemPrompt}
+
+## Worktrunk aliases
+
+The user can invoke these configured Worktrunk aliases as slash commands:
+
+${commands}
+
+When one fits the task, suggest the exact slash command to the user.
+These aliases are not agent tools, so do not try to invoke them through bash or the worktree tool.`,
     };
   });
   pi.on("agent_start", (_event, ctx) => tracker.markWorking(ctx.cwd));
