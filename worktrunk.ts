@@ -155,6 +155,7 @@ export type WorktrunkAlias = {
 type AliasToolOutputDetails = {
   alias: string;
   args: string[];
+  cancelled?: boolean;
   truncated: boolean;
   fullOutputPath?: string;
 };
@@ -1438,13 +1439,13 @@ export default function (pi: ExtensionAPI) {
       name: "worktree_alias",
       label: "Worktrunk Alias",
       description:
-        "Run a configured Worktrunk alias. Alias pipelines may merge, deploy, " +
-        "publish, remove worktrees, or perform other external actions, so use " +
-        "this tool only when the user explicitly requests an action that matches " +
-        `one of these aliases:\n${catalog}`,
+        "Run a configured Worktrunk alias after the user confirms the exact " +
+        "invocation. Alias pipelines may merge, deploy, publish, remove " +
+        "worktrees, or perform other external actions.",
       promptSnippet: `Run explicitly requested Worktrunk aliases: ${aliasNames.join(", ")}`,
       promptGuidelines: [
         "Use worktree_alias when the user explicitly requests an action that matches a configured Worktrunk alias.",
+        "Only pass worktree_alias arguments that the user explicitly supplied; do not infer flags or operands.",
         "Do not call worktree_alias based only on an inferred next step; aliases may perform destructive or external actions.",
       ],
       parameters: Type.Object(
@@ -1456,7 +1457,10 @@ export default function (pi: ExtensionAPI) {
                 description:
                   "One argument passed directly to the alias without shell expansion.",
               }),
-              { description: "Arguments passed directly to the alias." },
+              {
+                description:
+                  "Arguments explicitly supplied by the user and passed directly to the alias.",
+              },
             ),
           ),
         },
@@ -1472,6 +1476,45 @@ export default function (pi: ExtensionAPI) {
           );
         }
         const args = params.args ?? [];
+        if (!ctx.hasUI) {
+          throw new WorktrunkError(
+            "Running a Worktrunk alias requires interactive or RPC mode so the user can confirm the exact command.",
+          );
+        }
+        const metadata = worktrunkAliasMetadata.find(
+          (candidate) => candidate.name === alias,
+        );
+        const formattedArgs = args.map((value) => JSON.stringify(value));
+        const command = ["wt", alias, ...formattedArgs].join(" ");
+        const confirmed = await ctx.ui.confirm(
+          `Run Worktrunk alias ${alias}?`,
+          [
+            `Command: ${command}`,
+            ...(metadata?.steps.length
+              ? [`Pipeline: ${metadata.steps.join(" -> ")}`]
+              : []),
+            "",
+            "This alias may perform destructive or external actions.",
+          ].join("\n"),
+        );
+        if (!confirmed) {
+          const details: AliasToolOutputDetails = {
+            alias,
+            args,
+            cancelled: true,
+            truncated: false,
+          };
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Cancelled Worktrunk alias ${alias}.`,
+              },
+            ],
+            details,
+          };
+        }
+
         const result = await runWorktrunkAlias(
           alias,
           args,

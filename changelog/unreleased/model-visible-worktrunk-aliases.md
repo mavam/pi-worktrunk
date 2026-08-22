@@ -14,4 +14,4 @@ The agent can now run configured Worktrunk aliases when you explicitly request a
 Land this PR.
 ```
 
-The agent calls the `worktree_alias` tool with `land`, while Worktrunk continues to enforce project-command approvals.
+The agent calls the `worktree_alias` tool with `land`. Pi shows the exact command and pipeline for confirmation before running it, and Worktrunk continues to enforce project-command approvals.

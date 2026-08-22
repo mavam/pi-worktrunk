@@ -136,11 +136,15 @@ When Worktrunk aliases are configured, the extension also registers
 | Parameter | Required | Behavior |
 | --- | --- | --- |
 | `alias` | Yes | Select a discovered alias such as `land`. |
-| `args` | No | Pass arguments directly to Worktrunk without shell expansion. |
+| `args` | No | Pass user-supplied arguments directly to Worktrunk without shell expansion. |
 
-The agent may call this tool only when you explicitly request an action that
-matches an alias. Alias pipelines can merge, deploy, publish, remove worktrees,
-or perform other external actions.
+The tool shows the exact `wt` invocation and pipeline step labels for your
+confirmation before it runs. It refuses to run in non-interactive modes that
+can't request confirmation. The agent must only include arguments that you
+explicitly supplied.
+
+Alias pipelines can merge, deploy, publish, remove worktrees, or perform other
+external actions.
 
 ## 🛡️ Safety
 
@@ -154,8 +158,8 @@ The extension delegates lifecycle decisions to Worktrunk:
 - Project hooks and aliases retain Worktrunk's approval gate. If a command
   reports that it needs approval, run `wt config approvals add` in a terminal,
   review the commands, and retry.
-- The agent runs a Worktrunk alias only after you explicitly request a matching
-  action. It doesn't treat aliases as automatic workflow steps.
+- The agent doesn't treat aliases as automatic workflow steps. Every agent tool
+  invocation requires your confirmation before Worktrunk runs it.
 - Session continuation requires confirmation, preserves the source session, and
   doesn't rewrite historical messages.
 
