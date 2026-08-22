@@ -70,25 +70,24 @@ this Worktrunk alias:
 
 ```toml
 [aliases]
-land = "gh pr merge --squash {{ args }}"
+deploy = "make deploy {{ args }}"
 ```
 
 becomes:
 
 ```text
-/wt land
-/wt land 42
+/wt deploy
+/wt deploy staging
 ```
 
 The extension discovers the effective aliases for the current repository when
 the session starts. When aliases exist, it registers a `worktree_alias` agent
-tool that lists their names and pipeline step labels. This lets you ask the
-agent to "land this PR" and have it run the configured `land` alias.
+tool that lists their names and pipeline step labels. For example, if you
+configure a `deploy` alias, you can ask the agent to deploy to staging.
 
-The model sees step labels such as `merge-pr`, `verify`, `sync-main`, and
-`cleanup`, but not the aliases' shell templates. Pi forwards arguments directly
-to Worktrunk without shell expansion, shows the command output, and preserves
-Worktrunk's approval checks for project aliases.
+The model sees an alias's pipeline step labels, but not its shell templates. Pi
+forwards arguments directly to Worktrunk without shell expansion, shows the
+command output, and preserves Worktrunk's approval checks for project aliases.
 
 An alias can remove the worktree in which Pi is running. If it does, use
 `/wt continue <target>` to continue the session in an existing worktree.
@@ -135,7 +134,7 @@ When Worktrunk aliases are configured, the extension also registers
 
 | Parameter | Required | Behavior |
 | --- | --- | --- |
-| `alias` | Yes | Select a discovered alias such as `land`. |
+| `alias` | Yes | Select a discovered alias such as `deploy`. |
 | `args` | No | Pass user-supplied arguments directly to Worktrunk without shell expansion. |
 
 The tool shows the exact `wt` invocation and pipeline step labels for your
