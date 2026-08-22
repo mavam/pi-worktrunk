@@ -1044,7 +1044,7 @@ test("extension lazily discovers a worktree from stored repository identity", as
   }
 });
 
-test("extension registers Worktrunk aliases as slash commands", async () => {
+test("extension exposes Worktrunk aliases under /worktree", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-alias-test-"));
   const handlers = new Map<string, (...args: any[]) => Promise<void>>();
   const commands = new Map<string, any>();
@@ -1069,7 +1069,8 @@ test("extension registers Worktrunk aliases as slash commands", async () => {
         if (args.length === 1 && args[0] === "--help") {
           return {
             code: 0,
-            stdout: "Commands:\n  list\n\nAliases:\n  land\n  worktree\n\nOptions:\n",
+            stdout:
+              "Commands:\n  list\n\nAliases:\n  land\n  list\n  worktree\n\nOptions:\n",
             stderr: "",
             killed: false,
           };
@@ -1094,10 +1095,16 @@ test("extension registers Worktrunk aliases as slash commands", async () => {
     await handlers.get("session_start")?.({}, sessionContext);
     await handlers.get("session_start")?.({}, sessionContext);
 
-    assert.deepEqual([...commands.keys()], ["worktree", "land"]);
-    assert.equal(commands.get("land").description, "Run Worktrunk alias: wt land");
+    assert.deepEqual([...commands.keys()], ["worktree"]);
+    const command = commands.get("worktree");
+    assert.deepEqual(command.getArgumentCompletions("la"), [
+      { value: "land", label: "land" },
+    ]);
+    assert.deepEqual(command.getArgumentCompletions("li"), [
+      { value: "list", label: "list" },
+    ]);
 
-    await commands.get("land").handler(`42 "two words" ''`, {
+    const commandContext = {
       cwd: root,
       signal: undefined,
       ui: {
@@ -1105,23 +1112,25 @@ test("extension registers Worktrunk aliases as slash commands", async () => {
           notifications.push({ message, level });
         },
       },
-    });
+    };
+    await command.handler("", commandContext);
+    await command.handler(`land 42 "two words" ''`, commandContext);
 
     assert.deepEqual(calls.at(-1), {
       program: "wt",
       args: ["land", "42", "two words", ""],
       cwd: root,
     });
-    assert.deepEqual(notifications, [
-      {
-        message:
-          "Merged pull request 42\n✓ Removed feature worktree\n\n" +
-          "The alias removed Pi's working directory. Use " +
-          "`/worktree continue <target>` to continue this session in an " +
-          "existing worktree.",
-        level: "info",
-      },
-    ]);
+    assert.equal(notifications[0]?.level, "info");
+    assert.match(notifications[0]?.message ?? "", /\/worktree land \[args\]/);
+    assert.deepEqual(notifications[1], {
+      message:
+        "Merged pull request 42\n✓ Removed feature worktree\n\n" +
+        "The alias removed Pi's working directory. Use " +
+        "`/worktree continue <target>` to continue this session in an " +
+        "existing worktree.",
+      level: "info",
+    });
   } finally {
     await rm(root, { recursive: true, force: true });
   }

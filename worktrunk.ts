@@ -647,6 +647,21 @@ const SUBCOMMANDS = [
   "help",
 ] as const;
 
+const RESERVED_SUBCOMMANDS = new Set<string>([
+  ...SUBCOMMANDS,
+  "ls",
+  "rm",
+  "config",
+]);
+
+function helpText(aliases: readonly string[]): string {
+  if (aliases.length === 0) return HELP_TEXT;
+  return (
+    `${HELP_TEXT}\n\nWorktrunk aliases:\n` +
+    aliases.map((alias) => `  /worktree ${alias} [args]`).join("\n")
+  );
+}
+
 function splitCommand(input: string): { command: string; args: string } {
   const trimmed = input.trim();
   if (!trimmed) return { command: "help", args: "" };
@@ -973,6 +988,7 @@ export async function handleWorktreeCommand(
   ctx: ExtensionCommandContext,
   client: WorktrunkClient,
   continueSession: ContinueSession = continueSessionInWorktree,
+  aliases: readonly string[] = [],
 ): Promise<void> {
   const { command: rawCommand, args } = splitCommand(input);
   const command =
@@ -987,7 +1003,7 @@ export async function handleWorktreeCommand(
   try {
     switch (command) {
       case "help":
-        ctx.ui.notify(HELP_TEXT, "info");
+        ctx.ui.notify(helpText(aliases), "info");
         return;
       case "list":
         await commandList(args, ctx, client);
@@ -1012,7 +1028,7 @@ export async function handleWorktreeCommand(
         return;
       default:
         ctx.ui.notify(
-          `Unknown worktree command: ${rawCommand}\n\n${HELP_TEXT}`,
+          `Unknown worktree command: ${rawCommand}\n\n${helpText(aliases)}`,
           "error",
         );
     }
@@ -1290,9 +1306,9 @@ export default function (pi: ExtensionAPI) {
   };
   const tracker = createMarkerUpdater(execWt);
   const client = createWorktrunkClient(runWt);
-  const registeredAliasCommands = new Set<string>();
+  const worktrunkAliases = new Set<string>();
 
-  async function registerAliasCommands(ctx: ExtensionContext) {
+  async function discoverAliases(ctx: ExtensionContext) {
     let result: WtResult;
     try {
       result = await runWt(["--help"], {
@@ -1304,16 +1320,9 @@ export default function (pi: ExtensionAPI) {
     }
     if (result.code !== 0) return;
 
+    worktrunkAliases.clear();
     for (const alias of parseWorktrunkAliasNames(result.stdout ?? "")) {
-      if (alias === "worktree" || registeredAliasCommands.has(alias)) {
-        continue;
-      }
-      registeredAliasCommands.add(alias);
-      pi.registerCommand(alias, {
-        description: `Run Worktrunk alias: wt ${alias}`,
-        handler: (args, ctx) =>
-          handleWorktrunkAliasCommand(alias, args, ctx, runWt),
-      });
+      if (!RESERVED_SUBCOMMANDS.has(alias)) worktrunkAliases.add(alias);
     }
   }
 
@@ -1370,11 +1379,23 @@ export default function (pi: ExtensionAPI) {
     getArgumentCompletions(argumentPrefix) {
       const prefix = argumentPrefix.trimStart();
       if (/\s/.test(prefix)) return null;
-      return SUBCOMMANDS.filter((command) => command.startsWith(prefix)).map(
-        (command) => ({ value: command, label: command }),
+      return [...SUBCOMMANDS, ...worktrunkAliases]
+        .filter((command) => command.startsWith(prefix))
+        .map((command) => ({ value: command, label: command }));
+    },
+    handler: (input, ctx) => {
+      const { command, args } = splitCommand(input);
+      if (worktrunkAliases.has(command)) {
+        return handleWorktrunkAliasCommand(command, args, ctx, runWt);
+      }
+      return handleWorktreeCommand(
+        input,
+        ctx,
+        client,
+        continueSessionInWorktree,
+        [...worktrunkAliases],
       );
     },
-    handler: (args, ctx) => handleWorktreeCommand(args, ctx, client),
   });
 
   pi.registerTool({
@@ -1525,7 +1546,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     await restoreRepositoryIdentity(ctx);
-    await registerAliasCommands(ctx);
+    await discoverAliases(ctx);
     await tracker.markWaiting(ctx.cwd);
   });
   pi.on("agent_start", (_event, ctx) => tracker.markWorking(ctx.cwd));

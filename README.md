@@ -20,7 +20,7 @@ pi install npm:pi-worktrunk
 - Adds tiny traffic lights to `wt list` so you can see whether pi is working or
   waiting for you
 - Gives you a `/worktree` command for interactive worktree management
-- Exposes configured Worktrunk aliases as matching slash commands
+- Exposes configured Worktrunk aliases as `/worktree` subcommands
 - Continues the current pi session in another worktree when you request it
 - Gives the model the same Worktrunk-backed controls through one `worktree` tool
 - Keeps Worktrunk as the source of truth, with no second layer of worktree magic
@@ -65,7 +65,7 @@ The command also supports `ls`, `rm`, and `config` as aliases for `list`,
 
 ### 🏷️ Worktrunk aliases
 
-Configured Worktrunk aliases appear as same-named slash commands. For example,
+Configured Worktrunk aliases appear as `/worktree` subcommands. For example,
 this Worktrunk alias:
 
 ```toml
@@ -76,8 +76,8 @@ land = "gh pr merge --squash {{ args }}"
 becomes:
 
 ```text
-/land
-/land 42
+/worktree land
+/worktree land 42
 ```
 
 The extension discovers the effective aliases for the current repository when
