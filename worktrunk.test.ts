@@ -434,6 +434,7 @@ test("/wt passes switch to Worktrunk and applies Pi placement", async () => {
   let command: any;
   const switchCalls: string[][] = [];
   const switchedSessions: string[] = [];
+  const pickerOptions: string[][] = [];
   const notifications: Array<{ message: string; level: string }> = [];
   let cancelSwitch = false;
   const sourceManager = SessionManager.create(source, sessionDir);
@@ -515,11 +516,18 @@ test("/wt passes switch to Worktrunk and applies Pi placement", async () => {
         notify(message: string, level: string) {
           notifications.push({ message, level });
         },
+        async select(_title: string, options: string[]) {
+          pickerOptions.push(options);
+          return options[1];
+        },
         async confirm() {
           return true;
         },
       },
     } as any;
+
+    await command.handler("switch --stay", context);
+    assert.deepEqual(pickerOptions, [["main [current, main]", "feature"]]);
 
     await command.handler("switch --create feature", context);
     await command.handler("switch -cv feature", context);

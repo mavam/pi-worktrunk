@@ -468,9 +468,7 @@ function formatWorktree(item: WorktreeItem): string {
   ].filter(Boolean);
   const suffix = labels.length > 0 ? ` [${labels.join(", ")}]` : "";
   const symbols = item.display?.symbols ? ` ${item.display.symbols}` : "";
-  return `${item.branch ?? "(detached)"}${suffix}${symbols}\n  ${
-    item.worktree?.path ?? "(no worktree path)"
-  }`;
+  return `${item.branch ?? "(detached)"}${suffix}${symbols}`;
 }
 
 function formatWorktreeStatus(item: WorktreeItem): string {
