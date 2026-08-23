@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 
@@ -643,7 +643,13 @@ test("/wt passes switch to Worktrunk and applies Pi placement", async () => {
     assert.equal(transition?.type, "custom_message");
     if (transition?.type === "custom_message") {
       assert.equal(transition.customType, "pi-worktrunk-session-transition");
+      assert.match(
+        transition.content as string,
+        /Previous absolute paths may be stale\./,
+      );
       assert.equal((transition.details as any).kind, "move");
+      assert.equal((transition.details as any).source.branch, "main");
+      assert.equal((transition.details as any).source.path, realpathSync(source));
       assert.equal(
         (transition.details as any).trail.at(-1).path,
         realpathSync(source),
@@ -1591,6 +1597,7 @@ test("extension registers markers, /wt, and the worktree tool", () => {
   const events: string[] = [];
   const commands: string[] = [];
   const tools: string[] = [];
+  const messageRenderers = new Map<string, (...args: any[]) => any>();
 
   extension({
     on(event: string, _handler: unknown) {
@@ -1602,6 +1609,9 @@ test("extension registers markers, /wt, and the worktree tool", () => {
     registerTool(tool: { name: string }) {
       tools.push(tool.name);
     },
+    registerMessageRenderer(type: string, renderer: (...args: any[]) => any) {
+      messageRenderers.set(type, renderer);
+    },
     exec() {
       throw new Error("exec should not run during registration");
     },
@@ -1609,6 +1619,55 @@ test("extension registers markers, /wt, and the worktree tool", () => {
 
   assert.deepEqual(commands, ["wt"]);
   assert.deepEqual(tools, ["worktree"]);
+  const renderer = messageRenderers.get("pi-worktrunk-session-transition");
+  assert.ok(renderer);
+  const theme = {
+    fg(_color: string, text: string) {
+      return text;
+    },
+    bold(text: string) {
+      return text;
+    },
+  };
+  const message = {
+    content: "Previous absolute paths may be stale.",
+    details: {
+      kind: "move",
+      source: {
+        branch: "feature/wt-session-placement",
+        path: `${homedir()}/code/pi-worktrunk.feature`,
+      },
+      target: {
+        branch: "main",
+        path: `${homedir()}/code/pi-worktrunk`,
+      },
+    },
+  };
+  const renderTransition = (expanded: boolean) =>
+    renderer(message, { expanded, outputPad: 0 }, theme)
+      .render(100)
+      .map((line: string) => line.trimEnd());
+  assert.deepEqual(renderTransition(false), [
+    "↪ Session moved",
+    "  feature/wt-session-placement → main",
+  ]);
+  assert.deepEqual(
+    renderTransition(true),
+    [
+      "↪ Session moved",
+      "  feature/wt-session-placement → main",
+      "",
+      "  From  ~/code/pi-worktrunk.feature",
+      "  To    ~/code/pi-worktrunk",
+    ],
+  );
+  for (const [kind, title] of [
+    ["fork", "⑂ Session forked"],
+    ["recovery", "↩ Session recovered"],
+  ]) {
+    message.details.kind = kind;
+    assert.equal(renderTransition(false)[0], title);
+  }
   assert.deepEqual(events, [
     "session_start",
     "agent_start",

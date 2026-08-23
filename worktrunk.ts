@@ -1,8 +1,8 @@
 import { spawn } from "node:child_process";
 import { existsSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { mkdtemp, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { basename, dirname, join, resolve, sep } from "node:path";
 
 import {
   DEFAULT_MAX_BYTES,
@@ -533,6 +533,17 @@ type SessionLocation = {
   commonDir?: string;
 };
 
+type SessionTransitionKind = "move" | "fork" | "recovery";
+
+type SessionTransitionDetails = {
+  kind: SessionTransitionKind;
+  source: SessionLocation;
+  target: SessionLocation;
+  trail: SessionLocation[];
+  sourceSession: string;
+  destinationSession: string;
+};
+
 type ParsedWtInvocation = {
   args: string[];
   command?: string;
@@ -1032,9 +1043,10 @@ function nextTrail(
 
 function createLinkedSession(
   ctx: ExtensionCommandContext,
+  source: SessionLocation,
   target: SessionLocation,
   trail: SessionLocation[],
-  kind: "move" | "fork" | "recovery",
+  kind: SessionTransitionKind,
 ): string {
   const sourceSession = ctx.sessionManager.getSessionFile();
   if (!sourceSession) {
@@ -1060,18 +1072,23 @@ function createLinkedSession(
     targetSessionDir,
   );
   const destination = SessionManager.open(destinationSession, targetSessionDir);
-  const verb = kind === "fork" ? "Forked" : "Moved";
+  const verb = kind === "fork"
+    ? "forked"
+    : kind === "recovery"
+      ? "recovered"
+      : "moved";
   destination.appendCustomMessageEntry(
     SESSION_TRANSITION_MESSAGE,
-    `${verb} the Pi session to ${target.path}. Use this worktree for subsequent file operations; earlier absolute paths may refer to another worktree.`,
+    `The Pi session ${verb} from ${source.path} to ${target.path}. Use the destination worktree for subsequent file operations. Previous absolute paths may be stale.`,
     true,
     {
       kind,
+      source,
       target,
       trail,
       sourceSession,
       destinationSession,
-    },
+    } satisfies SessionTransitionDetails,
   );
   return destinationSession;
 }
@@ -1277,6 +1294,59 @@ function gitWorktreePaths(output: string): string[] {
 }
 
 export default function (pi: ExtensionAPI) {
+  pi.registerMessageRenderer?.(
+    SESSION_TRANSITION_MESSAGE,
+    (message, { expanded, outputPad }, theme) => {
+      const details = message.details as Partial<SessionTransitionDetails> | undefined;
+      const kind = details?.kind === "fork" || details?.kind === "recovery"
+        ? details.kind
+        : "move";
+      const presentation = kind === "fork"
+        ? { icon: "⑂", title: "Session forked" }
+        : kind === "recovery"
+          ? { icon: "↩", title: "Session recovered" }
+          : { icon: "↪", title: "Session moved" };
+      const source = details?.source;
+      const target = details?.target;
+      const locationLabel = (location: SessionLocation) =>
+        location.branch ?? basename(location.path);
+      const compactPath = (path: string) => {
+        const home = homedir();
+        return path === home || path.startsWith(`${home}${sep}`)
+          ? `~${path.slice(home.length)}`
+          : path;
+      };
+
+      let text = theme.fg(
+        "accent",
+        theme.bold(`${presentation.icon} ${presentation.title}`),
+      );
+      if (source?.path && target?.path) {
+        text += `\n  ${theme.fg("muted", locationLabel(source))}`;
+        text += ` ${theme.fg("dim", "→")} `;
+        text += theme.fg("accent", theme.bold(locationLabel(target)));
+        if (expanded) {
+          text += `\n\n  ${theme.fg("dim", "From")}  ${compactPath(source.path)}`;
+          text += `\n  ${theme.fg("dim", "To")}    ${compactPath(target.path)}`;
+        }
+      } else if (target?.path) {
+        text += `\n  ${theme.fg("accent", theme.bold(locationLabel(target)))}`;
+        if (expanded) {
+          text += `\n\n  ${theme.fg("dim", "To")}  ${compactPath(target.path)}`;
+        }
+      } else {
+        const content = typeof message.content === "string"
+          ? message.content
+          : message.content
+              .filter((block) => block.type === "text")
+              .map((block) => block.text)
+              .join("\n");
+        text += `\n  ${theme.fg("muted", content)}`;
+      }
+      return new Text(text, outputPad, 0);
+    },
+  );
+
   const execWt: RunWt = (args, options) => pi.exec("wt", args, options);
   let storedRepositoryIdentity: RepositoryIdentity | undefined;
 
@@ -1607,13 +1677,20 @@ export default function (pi: ExtensionAPI) {
 
   async function activateLinkedSession(
     ctx: ExtensionCommandContext,
+    source: SessionLocation,
     target: SessionLocation,
     trail: SessionLocation[],
     kind: "move" | "recovery",
     announcement: string,
   ): Promise<void> {
     await ctx.waitForIdle();
-    const destinationSession = createLinkedSession(ctx, target, trail, kind);
+    const destinationSession = createLinkedSession(
+      ctx,
+      source,
+      target,
+      trail,
+      kind,
+    );
     const result = await ctx.switchSession(destinationSession, {
       withSession: async (nextCtx) => {
         nextCtx.ui.notify(announcement, "info");
@@ -1855,6 +1932,7 @@ export default function (pi: ExtensionAPI) {
       try {
         await activateLinkedSession(
           ctx,
+          source,
           target,
           recovery.trail,
           "recovery",
@@ -1963,6 +2041,7 @@ export default function (pi: ExtensionAPI) {
       try {
         const destinationSession = createLinkedSession(
           ctx,
+          source,
           target,
           updatedTrail,
           "fork",
@@ -2008,6 +2087,7 @@ export default function (pi: ExtensionAPI) {
     try {
       await activateLinkedSession(
         ctx,
+        source,
         target,
         updatedTrail,
         "move",
