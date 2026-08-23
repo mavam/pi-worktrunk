@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -11,13 +11,12 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import extension, {
   MARKERS,
   createMarkerUpdater,
-  createSessionContinuator,
   createWorktrunkClient,
-  forkSessionFromSnapshot,
-  handleWorktreeCommand,
+  configuredSessionPosture,
+  defaultPlacementAction,
   markerArgs,
-  materializeSessionSnapshot,
   parseAliasArguments,
+  parseWtInvocation,
   parseWorktrunkAliasMetadata,
   parseWorktrunkAliasNames,
 } from "./worktrunk.ts";
@@ -284,61 +283,704 @@ test("Worktrunk client exposes the supported lifecycle operations", async () => 
   ]);
 });
 
-test("/wt create reports the path and keeps Pi in place", async () => {
-  const notifications: Array<[string, string]> = [];
-  const client = {
-    async create(_cwd: string, branch: string) {
-      return { branch, path: "/repo.feature-auth" };
-    },
-  };
-
-  await handleWorktreeCommand(
-    "create feature/auth",
-    {
-      cwd: "/repo",
-      hasUI: false,
-      ui: {
-        notify(message: string, level: string) {
-          notifications.push([message, level]);
-        },
-      },
-    } as any,
-    client as any,
+test("Pi placement modifiers are removed before Worktrunk runs", () => {
+  assert.deepEqual(parseWtInvocation("switch --create fix --fork"), {
+    args: ["switch", "--create", "fix"],
+    command: "switch",
+    commandIndex: 0,
+    commandArgs: ["--create", "fix"],
+    modifier: "fork",
+  });
+  assert.deepEqual(parseWtInvocation("deploy --go -- --go"), {
+    args: ["deploy", "--", "--go"],
+    command: "deploy",
+    commandIndex: 0,
+    commandArgs: ["--", "--go"],
+    modifier: "go",
+  });
+  assert.throws(
+    () => parseWtInvocation("switch fix --go --stay"),
+    /Use only one/,
   );
-
-  assert.deepEqual(notifications, [
-    [
-      "Created feature/auth.\nPath: /repo.feature-auth\nPi remains in /repo.",
-      "info",
-    ],
-  ]);
 });
 
-test("/wt create can continue the session in the new worktree", async () => {
-  const continuationTargets: Array<{ branch: string | null; path: string }> = [];
-  const client = {
-    async create(_cwd: string, branch: string) {
-      return { branch, path: "/repo.feature-auth" };
+test("/wt reports parse errors in JSON mode", async () => {
+  let command: any;
+  const messages: any[] = [];
+  extension({
+    on() {},
+    appendEntry() {},
+    registerTool() {},
+    registerCommand(_name: string, definition: any) {
+      command = definition;
     },
-  };
+    sendMessage(message: any) {
+      messages.push(message);
+    },
+    exec() {
+      throw new Error("Worktrunk must not run after a parse error");
+    },
+  } as any);
 
-  await handleWorktreeCommand(
-    "create feature/auth --continue",
-    {
-      cwd: "/repo",
-      hasUI: false,
-      ui: { notify() {} },
-    } as any,
-    client as any,
-    async (_ctx, target) => {
-      continuationTargets.push(target);
+  await command.handler("switch feature --go --stay", {
+    mode: "json",
+    sessionManager: { getSessionFile: () => "/sessions/source.jsonl" },
+    ui: { notify() { throw new Error("notify is silent in JSON mode"); } },
+  });
+
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].customType, "pi-worktrunk-command");
+  assert.match(messages[0].content, /Use only one/);
+  assert.equal(messages[0].details.level, "error");
+
+  await command.handler("switch feature --go", {
+    mode: "json",
+    sessionManager: { getSessionFile: () => undefined },
+    ui: { notify() { throw new Error("notify is silent in JSON mode"); } },
+  });
+  assert.equal(messages.length, 2);
+  assert.match(messages[1].content, /requires a persisted Pi session/);
+});
+
+test("bare /wt list reports discovery failures", async () => {
+  let command: any;
+  const notifications: Array<{ message: string; level: string }> = [];
+  extension({
+    on() {},
+    appendEntry() {},
+    registerTool() {},
+    registerCommand(_name: string, definition: any) {
+      command = definition;
+    },
+    async exec() {
+      return {
+        code: 1,
+        stdout: "",
+        stderr: "fatal: not a git repository",
+        killed: false,
+      };
+    },
+  } as any);
+
+  await command.handler("list", {
+    cwd: process.cwd(),
+    mode: "tui",
+    hasUI: true,
+    signal: undefined,
+    sessionManager: { getSessionFile: () => "/sessions/source.jsonl" },
+    async waitForIdle() {},
+    ui: {
+      notify(message: string, level: string) {
+        notifications.push({ message, level });
+      },
+    },
+  });
+
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].level, "error");
+  assert.match(notifications[0].message, /not a git repository/);
+  assert.doesNotMatch(notifications[0].message, /No worktrees found/);
+});
+
+test("session posture selects the default placement", () => {
+  assert.equal(configuredSessionPosture(undefined), "infer");
+  assert.equal(configuredSessionPosture("follow"), "follow");
+  assert.equal(configuredSessionPosture("stay"), "stay");
+  assert.equal(configuredSessionPosture("ask"), "ask");
+  assert.equal(configuredSessionPosture("invalid"), "infer");
+
+  const base = {
+    interactive: true,
+    persisted: true,
+    command: "switch",
+    targetCreated: false,
+    hasTarget: true,
+  } as const;
+  assert.equal(defaultPlacementAction({ ...base, posture: "infer" }), "go");
+  assert.equal(defaultPlacementAction({
+    ...base,
+    posture: "infer",
+    targetCreated: true,
+  }), "stay");
+  assert.equal(defaultPlacementAction({ ...base, posture: "follow" }), "go");
+  assert.equal(defaultPlacementAction({ ...base, posture: "stay" }), "stay");
+  assert.equal(defaultPlacementAction({ ...base, posture: "ask" }), "ask");
+  assert.equal(defaultPlacementAction({
+    ...base,
+    posture: "follow",
+    hasTarget: false,
+  }), "stay");
+  assert.equal(defaultPlacementAction({
+    ...base,
+    posture: "follow",
+    interactive: false,
+  }), "stay");
+  assert.equal(defaultPlacementAction({
+    ...base,
+    posture: "follow",
+    persisted: false,
+  }), "stay");
+});
+
+test("/wt passes switch to Worktrunk and applies Pi placement", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-placement-test-"));
+  const source = join(root, "repo");
+  const target = join(root, "repo.feature");
+  const commonDir = join(source, ".git");
+  const sessionDir = join(root, "sessions");
+  await mkdir(commonDir, { recursive: true });
+  await mkdir(target);
+
+  let command: any;
+  const switchCalls: string[][] = [];
+  const switchedSessions: string[] = [];
+  const notifications: Array<{ message: string; level: string }> = [];
+  let cancelSwitch = false;
+  const sourceManager = SessionManager.create(source, sessionDir);
+  sourceManager.appendSessionInfo("placement test");
+
+  const list = JSON.stringify({
+    schema: 2,
+    items: [
+      {
+        branch: "main",
+        worktree: { path: source, main: true, current: true },
+      },
+      {
+        branch: "feature",
+        worktree: { path: target, main: false, current: false },
+      },
+    ],
+  });
+
+  try {
+    extension({
+      on() {},
+      appendEntry() {},
+      registerCommand(_name: string, definition: any) {
+        command = definition;
+      },
+      registerTool() {},
+      async exec(program: string, args: string[]) {
+        if (program === "git") {
+          return { code: 0, stdout: `${commonDir}\n`, stderr: "", killed: false };
+        }
+        if (args.includes("list")) {
+          return { code: 0, stdout: list, stderr: "", killed: false };
+        }
+        if (args.includes("switch")) {
+          switchCalls.push([...args]);
+          const targetsMain = args.includes("main");
+          const createsTarget = ["--create", "-cv", "-vc"].some((option) =>
+            args.includes(option)
+          );
+          return {
+            code: 0,
+            stdout: JSON.stringify({
+              action: createsTarget ? "created" : "existing",
+              branch: targetsMain ? "main" : "feature",
+              path: targetsMain ? source : target,
+              created_branch: createsTarget,
+            }),
+            stderr: createsTarget
+              ? "✓ Created feature worktree"
+              : "○ Switched to feature worktree",
+            killed: false,
+          };
+        }
+        return { code: 0, stdout: "", stderr: "", killed: false };
+      },
+    } as any);
+
+    const context = {
+      cwd: source,
+      mode: "tui",
+      hasUI: true,
+      signal: undefined,
+      sessionManager: sourceManager,
+      async waitForIdle() {},
+      async switchSession(path: string, options: any) {
+        switchedSessions.push(path);
+        if (cancelSwitch) return { cancelled: true };
+        await options.withSession({
+          ui: {
+            notify(message: string, level: string) {
+              notifications.push({ message, level });
+            },
+          },
+        });
+        return { cancelled: false };
+      },
+      ui: {
+        notify(message: string, level: string) {
+          notifications.push({ message, level });
+        },
+        async confirm() {
+          return true;
+        },
+      },
+    } as any;
+
+    await command.handler("switch --create feature", context);
+    await command.handler("switch -cv feature", context);
+    await command.handler("switch -vc feature", context);
+    assert.equal(switchedSessions.length, 0);
+
+    await command.handler("switch --create feature --fork", context);
+    assert.equal(switchedSessions.length, 0);
+    assert.ok(notifications.some(({ message }) =>
+      message.includes("Created a second Pi session in feature"),
+    ));
+
+    const launched = join(target, "fork-launched");
+    const previousLauncher = process.env.PI_WORKTRUNK_FORK_COMMAND;
+    process.env.PI_WORKTRUNK_FORK_COMMAND =
+      'printf %s "$PI_WORKTRUNK_TARGET_SESSION" > "$PI_WORKTRUNK_TARGET_CWD/fork-launched"';
+    try {
+      await command.handler("switch --create feature --fork", context);
+      for (let attempt = 0; attempt < 50 && !existsSync(launched); attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    } finally {
+      if (previousLauncher === undefined) {
+        delete process.env.PI_WORKTRUNK_FORK_COMMAND;
+      } else {
+        process.env.PI_WORKTRUNK_FORK_COMMAND = previousLauncher;
+      }
+    }
+    assert.ok(existsSync(launched));
+    assert.match(await readFile(launched, "utf8"), /\.jsonl$/);
+    assert.ok(notifications.some(({ message }) =>
+      message.includes("Created and launched a second Pi session in feature"),
+    ));
+
+    const previousShell = process.env.SHELL;
+    process.env.PI_WORKTRUNK_FORK_COMMAND = "true";
+    process.env.SHELL = join(root, "missing-shell");
+    try {
+      await command.handler("switch feature --fork", context);
+    } finally {
+      if (previousLauncher === undefined) {
+        delete process.env.PI_WORKTRUNK_FORK_COMMAND;
+      } else {
+        process.env.PI_WORKTRUNK_FORK_COMMAND = previousLauncher;
+      }
+      if (previousShell === undefined) {
+        delete process.env.SHELL;
+      } else {
+        process.env.SHELL = previousShell;
+      }
+    }
+    assert.ok(notifications.some(({ message, level }) =>
+      level === "warning" &&
+      message.includes("Could not launch the second Pi session") &&
+      message.includes("Run: pi --session"),
+    ));
+
+    await command.handler("switch feature --stay --format=json", context);
+    assert.ok(notifications.some(({ message }) =>
+      message.startsWith('{"action":"existing"'),
+    ));
+
+    await command.handler("switch main --go", context);
+    assert.equal(switchedSessions.length, 0);
+    assert.ok(notifications.some(({ message }) =>
+      message.includes("already in main"),
+    ));
+
+    await command.handler("switch main --fork", context);
+    assert.equal(switchedSessions.length, 0);
+    assert.ok(notifications.some(({ message }) =>
+      message.includes("Created a second Pi session in main"),
+    ));
+
+    let printed = "";
+    const write = process.stdout.write;
+    process.stdout.write = ((chunk: string | Uint8Array) => {
+      printed += chunk.toString();
       return true;
+    }) as typeof process.stdout.write;
+    try {
+      await command.handler("switch feature --go", {
+        ...context,
+        mode: "print",
+      });
+    } finally {
+      process.stdout.write = write;
+    }
+    assert.match(printed, /Session would move from main to feature/);
+    assert.equal(switchedSessions.length, 0);
+
+    cancelSwitch = true;
+    await command.handler("switch feature --go", context);
+    assert.equal(switchedSessions.length, 1);
+    assert.ok(existsSync(sourceManager.getSessionFile()!));
+    assert.ok(existsSync(switchedSessions[0]));
+    assert.ok(notifications.some(({ message, level }) =>
+      level === "error" && message.includes("session switching was cancelled"),
+    ));
+
+    cancelSwitch = false;
+    await command.handler("switch feature", context);
+    assert.equal(switchedSessions.length, 2);
+    assert.ok(switchCalls.every((args) =>
+      args.includes("--no-cd") && args.includes("--format=json"),
+    ));
+
+    const destinationSession = switchedSessions.at(-1)!;
+    assert.equal(dirname(destinationSession), sessionDir);
+    const destination = SessionManager.open(destinationSession, sessionDir);
+    assert.equal(destination.getCwd(), realpathSync(target));
+    const transition = destination.getEntries().at(-1);
+    assert.equal(transition?.type, "custom_message");
+    if (transition?.type === "custom_message") {
+      assert.equal(transition.customType, "pi-worktrunk-session-transition");
+      assert.equal((transition.details as any).kind, "move");
+      assert.equal(
+        (transition.details as any).trail.at(-1).path,
+        realpathSync(source),
+      );
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("/wt switch - preserves flags and ignores foreign trail entries", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-back-test-"));
+  const main = join(root, "repo");
+  const source = join(root, "repo.feature");
+  const foreign = join(root, "foreign");
+  const commonDir = join(main, ".git");
+  const foreignCommonDir = join(foreign, ".git");
+  const sessionDir = join(root, "sessions");
+  await mkdir(commonDir, { recursive: true });
+  await mkdir(source);
+  await mkdir(foreignCommonDir, { recursive: true });
+
+  const handlers = new Map<string, (...args: any[]) => Promise<void>>();
+  let command: any;
+  const calls: string[][] = [];
+  const switchedSessions: string[] = [];
+  const sourceManager = SessionManager.create(source, sessionDir);
+  sourceManager.appendCustomMessageEntry(
+    "pi-worktrunk-session-transition",
+    "trail",
+    true,
+    {
+      trail: [
+        { branch: "main", path: main, commonDir },
+        { branch: "foreign", path: foreign, commonDir: foreignCommonDir },
+      ],
     },
   );
 
-  assert.deepEqual(continuationTargets, [
-    { branch: "feature/auth", path: "/repo.feature-auth" },
-  ]);
+  const list = JSON.stringify({
+    schema: 2,
+    items: [
+      { branch: "main", worktree: { path: main, main: true, current: false } },
+      { branch: "feature", worktree: { path: source, main: false, current: true } },
+      { branch: "recreated", worktree: { path: foreign, main: false, current: false } },
+    ],
+  });
+
+  try {
+    extension({
+      on(event: string, handler: (...args: any[]) => Promise<void>) {
+        handlers.set(event, handler);
+      },
+      appendEntry() {},
+      registerCommand(_name: string, definition: any) {
+        command = definition;
+      },
+      registerTool() {},
+      async exec(program: string, args: string[]) {
+        if (program === "git") {
+          return { code: 0, stdout: `${commonDir}\n`, stderr: "", killed: false };
+        }
+        if (args.length === 1 && args[0] === "--help") {
+          return { code: 0, stdout: "Commands:\n  switch\n", stderr: "", killed: false };
+        }
+        if (args.includes("list")) {
+          return { code: 0, stdout: list, stderr: "", killed: false };
+        }
+        if (args.includes("switch")) {
+          calls.push([...args]);
+          return { code: 0, stdout: "launched", stderr: "", killed: false };
+        }
+        return { code: 0, stdout: "", stderr: "", killed: false };
+      },
+    } as any);
+
+    await handlers.get("session_start")?.({}, {
+      cwd: source,
+      signal: undefined,
+      sessionManager: sourceManager,
+    });
+
+    await command.handler(
+      `-v switch - --no-hooks -x echo --go -- hello`,
+      {
+        cwd: source,
+        mode: "tui",
+        hasUI: true,
+        signal: undefined,
+        sessionManager: sourceManager,
+        async waitForIdle() {},
+        async switchSession(path: string, options: any) {
+          switchedSessions.push(path);
+          await options.withSession({ ui: { notify() {} } });
+          return { cancelled: false };
+        },
+        ui: { notify() {} },
+      } as any,
+    );
+
+    assert.deepEqual(calls, [[
+      "-v",
+      "switch",
+      main,
+      "--no-hooks",
+      "-x",
+      "echo",
+      "--",
+      "hello",
+    ]]);
+    assert.equal(switchedSessions.length, 1);
+    assert.equal(
+      SessionManager.open(switchedSessions[0], sessionDir).getCwd(),
+      realpathSync(main),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("/wt recovers after a failed command removes the current worktree", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-recovery-test-"));
+  const main = join(root, "repo");
+  const source = join(root, "repo.feature");
+  const commonDir = join(main, ".git");
+  const sessionDir = join(root, "sessions");
+  await mkdir(commonDir, { recursive: true });
+  await mkdir(source);
+
+  let command: any;
+  const handlers = new Map<string, (...args: any[]) => Promise<void>>();
+  const notifications: Array<{ message: string; level: string }> = [];
+  const switchedSessions: string[] = [];
+  const sourceManager = SessionManager.create(source, sessionDir);
+  sourceManager.appendSessionInfo("recovery test");
+
+  const list = (includeSource: boolean) => JSON.stringify({
+    schema: 2,
+    items: [
+      {
+        branch: "main",
+        worktree: { path: main, main: true, current: !includeSource },
+      },
+      ...(includeSource
+        ? [{
+            branch: "feature",
+            worktree: { path: source, main: false, current: true },
+          }]
+        : []),
+    ],
+  });
+
+  try {
+    extension({
+      on(event: string, handler: (...args: any[]) => Promise<void>) {
+        handlers.set(event, handler);
+      },
+      appendEntry() {},
+      registerCommand(_name: string, definition: any) {
+        command = definition;
+      },
+      registerTool() {},
+      async exec(program: string, args: string[], options?: { cwd?: string }) {
+        if (program === "git" && args.includes("worktree")) {
+          return {
+            code: 0,
+            stdout: `worktree ${main}\0HEAD aaaa\0branch refs/heads/main\0\0`,
+            stderr: "",
+            killed: false,
+          };
+        }
+        if (program === "git") {
+          return { code: 0, stdout: `${commonDir}\n`, stderr: "", killed: false };
+        }
+        if (args.length === 1 && args[0] === "--help") {
+          return { code: 0, stdout: "Commands:\n  list\n", stderr: "", killed: false };
+        }
+        if (args.includes("list")) {
+          return {
+            code: 0,
+            stdout: list(existsSync(source)),
+            stderr: "",
+            killed: false,
+          };
+        }
+        if (args[0] === "land") {
+          await rm(source, { recursive: true, force: true });
+          return { code: 1, stdout: "", stderr: "land failed after cleanup", killed: false };
+        }
+        return { code: 0, stdout: "", stderr: "", killed: false };
+      },
+    } as any);
+
+    await handlers.get("session_start")?.({}, {
+      cwd: source,
+      signal: undefined,
+      sessionManager: sourceManager,
+    });
+
+    await command.handler("land --stay", {
+      cwd: source,
+      mode: "tui",
+      hasUI: true,
+      signal: undefined,
+      sessionManager: sourceManager,
+      async waitForIdle() {},
+      async switchSession(path: string, options: any) {
+        switchedSessions.push(path);
+        await options.withSession({
+          ui: {
+            notify(message: string, level: string) {
+              notifications.push({ message, level });
+            },
+          },
+        });
+        return { cancelled: false };
+      },
+      ui: {
+        notify(message: string, level: string) {
+          notifications.push({ message, level });
+        },
+      },
+    } as any);
+
+    assert.equal(switchedSessions.length, 1);
+    assert.equal(
+      SessionManager.open(switchedSessions[0], sessionDir).getCwd(),
+      realpathSync(main),
+    );
+    assert.ok(notifications.some(({ message }) =>
+      message.includes("because the current worktree was removed"),
+    ));
+    assert.ok(notifications.some(({ message, level }) =>
+      level === "error" && message.includes("land failed after cleanup"),
+    ));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("/wt runs an explicit switch from a deleted working directory", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-deleted-cwd-test-"));
+  const main = join(root, "repo");
+  const source = join(root, "repo.deleted");
+  const commonDir = join(main, ".git");
+  const sessionDir = join(root, "sessions");
+  await mkdir(commonDir, { recursive: true });
+
+  const handlers = new Map<string, (...args: any[]) => Promise<void>>();
+  let command: any;
+  const calls: Array<{ program: string; args: string[]; cwd?: string }> = [];
+  const notifications: Array<{ message: string; level: string }> = [];
+  const switchedSessions: string[] = [];
+  const sourceManager = SessionManager.create(source, sessionDir);
+  const stat = statSync(commonDir);
+  sourceManager.appendCustomEntry("pi-worktrunk-repository", {
+    commonDir,
+    device: stat.dev,
+    inode: stat.ino,
+  });
+  const list = JSON.stringify({
+    schema: 2,
+    items: [
+      { branch: "main", worktree: { path: main, main: true, current: true } },
+    ],
+  });
+
+  try {
+    extension({
+      on(event: string, handler: (...args: any[]) => Promise<void>) {
+        handlers.set(event, handler);
+      },
+      appendEntry() {},
+      registerCommand(_name: string, definition: any) {
+        command = definition;
+      },
+      registerTool() {},
+      async exec(program: string, args: string[], options?: { cwd?: string }) {
+        calls.push({ program, args: [...args], cwd: options?.cwd });
+        if (program === "git" && args.includes("worktree")) {
+          return {
+            code: 0,
+            stdout: `worktree ${main}\0HEAD aaaa\0branch refs/heads/main\0\0`,
+            stderr: "",
+            killed: false,
+          };
+        }
+        if (program === "git") {
+          return { code: 0, stdout: `${commonDir}\n`, stderr: "", killed: false };
+        }
+        if (args.length === 1 && args[0] === "--help") {
+          return { code: 0, stdout: "Commands:\n  switch\n", stderr: "", killed: false };
+        }
+        if (args.includes("list")) {
+          return { code: 0, stdout: list, stderr: "", killed: false };
+        }
+        if (args.includes("switch")) {
+          return {
+            code: 0,
+            stdout: JSON.stringify({ action: "existing", branch: "main", path: main }),
+            stderr: "○ Switched to main",
+            killed: false,
+          };
+        }
+        return { code: 0, stdout: "", stderr: "", killed: false };
+      },
+    } as any);
+
+    await handlers.get("session_start")?.({}, {
+      cwd: source,
+      signal: undefined,
+      sessionManager: sourceManager,
+    });
+
+    await command.handler("switch main --go", {
+      cwd: source,
+      mode: "tui",
+      hasUI: true,
+      signal: undefined,
+      sessionManager: sourceManager,
+      async waitForIdle() {},
+      async switchSession(path: string, options: any) {
+        switchedSessions.push(path);
+        await options.withSession({ ui: { notify() {} } });
+        return { cancelled: false };
+      },
+      ui: {
+        notify(message: string, level: string) {
+          notifications.push({ message, level });
+        },
+      },
+    } as any);
+
+    assert.ok(calls.some(({ program, args, cwd }) =>
+      program === "wt" && args.includes("switch") && cwd === main,
+    ));
+    assert.equal(switchedSessions.length, 1);
+    assert.equal(
+      SessionManager.open(switchedSessions[0], sessionDir).getCwd(),
+      realpathSync(main),
+    );
+    assert.ok(notifications.every(({ message }) => !message.includes("ENOENT")));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("missing working directories are not reported as missing Worktrunk", async () => {
@@ -364,39 +1006,11 @@ test("missing working directories are not reported as missing Worktrunk", async 
   }
 });
 
-test("/wt continue resolves an existing worktree", async () => {
-  const continuationTargets: Array<{ branch: string | null; path: string }> = [];
-  const client = {
-    async list() {
-      return (JSON.parse(worktreeList) as { items: any[] }).items;
-    },
-  };
-
-  await handleWorktreeCommand(
-    "continue feature/auth",
-    {
-      cwd: "/repo",
-      hasUI: false,
-      ui: { notify() {} },
-    } as any,
-    client as any,
-    async (_ctx, target) => {
-      continuationTargets.push(target);
-      return true;
-    },
-  );
-
-  assert.deepEqual(continuationTargets, [
-    { branch: "feature/auth", path: "/repo.feature-auth" },
-  ]);
-});
-
 test("relocated lists do not claim the fallback is Pi's current worktree", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-test-"));
   const main = join(root, "repo");
   const removed = join(root, "repo.deleted");
   await mkdir(main);
-  const continuationTargets: Array<{ branch: string | null; path: string }> = [];
   const list = JSON.stringify({
     schema: 2,
     items: [
@@ -410,365 +1024,10 @@ test("relocated lists do not claim the fallback is Pi's current worktree", async
   }));
 
   try {
-    await handleWorktreeCommand(
-      "continue",
-      {
-        cwd: removed,
-        hasUI: true,
-        ui: {
-          async select(_title: string, options: string[]) {
-            assert.equal(options.length, 1);
-            return options[0];
-          },
-          notify() {},
-        },
-      } as any,
-      client,
-      async (_ctx, target) => {
-        continuationTargets.push(target);
-        return true;
-      },
-    );
-
-    assert.deepEqual(continuationTargets, [{ branch: "main", path: main }]);
     assert.equal((await client.list(removed))[0].worktree?.current, false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
-});
-
-test("session continuation forks, switches, and records the cwd transition", async () => {
-  const forks: Array<[string, string, string | undefined]> = [];
-  const confirmations: Array<[string, string]> = [];
-  const switched: string[] = [];
-  const messages: any[] = [];
-  const notifications: Array<[string, string]> = [];
-  let waited = false;
-
-  const continueSession = createSessionContinuator(
-    (source, target, _snapshot, targetSessionDir) => {
-      forks.push([source, target, targetSessionDir]);
-      return "/sessions/continued.jsonl";
-    },
-  );
-
-  const continued = await continueSession(
-    {
-      cwd: "/repo",
-      hasUI: true,
-      sessionManager: {
-        getSessionFile() {
-          return "/sessions/source.jsonl";
-        },
-        getHeader() {
-          return {
-            type: "session",
-            version: 3,
-            id: "source-id",
-            timestamp: "2026-08-09T17:29:46.150Z",
-            cwd: "/repo",
-          };
-        },
-        getEntries() {
-          return [];
-        },
-        usesDefaultSessionDir() {
-          return true;
-        },
-        getSessionDir() {
-          throw new Error("default session directory should be implicit");
-        },
-      },
-      async waitForIdle() {
-        waited = true;
-      },
-      ui: {
-        async confirm(title: string, message: string) {
-          confirmations.push([title, message]);
-          return true;
-        },
-        notify(message: string, level: string) {
-          notifications.push([message, level]);
-        },
-      },
-      async switchSession(path: string, options: any) {
-        switched.push(path);
-        await options.withSession({
-          async sendMessage(message: any) {
-            messages.push(message);
-          },
-          ui: {
-            notify(message: string, level: string) {
-              notifications.push([message, level]);
-            },
-          },
-        });
-        return { cancelled: false };
-      },
-    } as any,
-    { branch: "feature/auth", path: "/repo.feature-auth" },
-  );
-
-  assert.equal(continued, true);
-  assert.equal(waited, true);
-  assert.deepEqual(forks, [
-    ["/sessions/source.jsonl", "/repo.feature-auth", undefined],
-  ]);
-  assert.deepEqual(switched, ["/sessions/continued.jsonl"]);
-  assert.equal(confirmations[0][0], "↪ Continue in feature/auth?");
-  assert.match(confirmations[0][1], /From\s+\/repo/);
-  assert.match(confirmations[0][1], /To\s+\/repo\.feature-auth/);
-  assert.match(confirmations[0][1], /the original stays available/);
-  assert.equal(messages[0].customType, "↪ Continued in worktree");
-  assert.match(messages[0].content, /^From:\s+\/repo$/m);
-  assert.match(messages[0].content, /^To:\s+\/repo\.feature-auth$/m);
-  assert.match(messages[0].content, /Use the new worktree for subsequent file operations/);
-  assert.deepEqual(messages[0].details, {
-    branch: "feature/auth",
-    sourceCwd: "/repo",
-    targetCwd: "/repo.feature-auth",
-    sourceSession: "/sessions/source.jsonl",
-    destinationSession: "/sessions/continued.jsonl",
-  });
-  assert.ok(
-    notifications.some(([message, level]) =>
-      level === "info" && message.includes("Continued the session"),
-    ),
-  );
-});
-
-test("session continuation keeps a fresh source in its custom session directory", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-test-"));
-  try {
-    const sessionDir = join(root, "sessions");
-    const sourceManager = SessionManager.create("/repo", sessionDir);
-    sourceManager.appendSessionInfo("fresh session");
-    const sourceSession = sourceManager.getSessionFile();
-    assert.ok(sourceSession);
-    assert.equal(existsSync(sourceSession), false);
-
-    let destinationSession: string | undefined;
-    const continueSession = createSessionContinuator(
-      (source, target, snapshot, targetSessionDir) => {
-        assert.equal(targetSessionDir, sessionDir);
-        const fork = forkSessionFromSnapshot(
-          source,
-          target,
-          snapshot,
-          targetSessionDir,
-        );
-        destinationSession = fork.destinationSession;
-        return fork;
-      },
-    );
-
-    const continued = await continueSession(
-      {
-        cwd: "/repo",
-        hasUI: true,
-        sessionManager: sourceManager,
-        async waitForIdle() {},
-        ui: {
-          async confirm() {
-            return true;
-          },
-          notify() {},
-        },
-        async switchSession(path: string, options: any) {
-          assert.equal(path, destinationSession);
-          await options.withSession({
-            async sendMessage() {},
-            ui: { notify() {} },
-          });
-          return { cancelled: false };
-        },
-      } as any,
-      { branch: "main", path: "/repo.main" },
-    );
-
-    assert.equal(continued, true);
-    assert.ok(destinationSession);
-    assert.equal(dirname(destinationSession), sessionDir);
-    assert.equal(existsSync(sourceSession), true);
-    assert.equal(existsSync(destinationSession), true);
-
-    const sourceEntries = (await readFile(sourceSession, "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line));
-    const destinationEntries = (await readFile(destinationSession, "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line));
-
-    assert.equal(sourceEntries[0].cwd, "/repo");
-    assert.equal(sourceEntries[1].type, "session_info");
-    assert.equal(sourceEntries[1].name, "fresh session");
-    assert.equal(destinationEntries[0].cwd, "/repo.main");
-    assert.equal(destinationEntries[0].parentSession, sourceSession);
-    assert.deepEqual(destinationEntries.slice(1), sourceEntries.slice(1));
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test("session continuation does not snapshot a persisted custom-directory source", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-test-"));
-  try {
-    const sessionDir = join(root, "sessions");
-    const sourceManager = SessionManager.create("/repo", sessionDir);
-    sourceManager.appendSessionInfo("persisted session");
-    const sourceSession = sourceManager.getSessionFile();
-    const sourceHeader = sourceManager.getHeader();
-    assert.ok(sourceSession);
-    assert.ok(sourceHeader);
-    materializeSessionSnapshot(sourceSession, {
-      header: sourceHeader,
-      entries: sourceManager.getEntries(),
-    });
-
-    let destinationSession: string | undefined;
-    const continueSession = createSessionContinuator(
-      (source, target, snapshot, targetSessionDir) => {
-        assert.equal(snapshot, undefined);
-        assert.equal(targetSessionDir, sessionDir);
-        const fork = forkSessionFromSnapshot(
-          source,
-          target,
-          snapshot,
-          targetSessionDir,
-        );
-        destinationSession = fork.destinationSession;
-        return fork;
-      },
-    );
-
-    const continued = await continueSession(
-      {
-        cwd: "/repo",
-        hasUI: true,
-        sessionManager: {
-          getSessionFile: () => sourceSession,
-          getHeader() {
-            throw new Error("persisted sources should not request a header");
-          },
-          getEntries() {
-            throw new Error("persisted sources should not request entries");
-          },
-          usesDefaultSessionDir: () => false,
-          getSessionDir: () => sessionDir,
-        },
-        async waitForIdle() {},
-        ui: {
-          async confirm() {
-            return true;
-          },
-          notify() {},
-        },
-        async switchSession(path: string, options: any) {
-          assert.equal(path, destinationSession);
-          await options.withSession({
-            async sendMessage() {},
-            ui: { notify() {} },
-          });
-          return { cancelled: false };
-        },
-      } as any,
-      { branch: "main", path: "/repo.main" },
-    );
-
-    assert.equal(continued, true);
-    assert.ok(destinationSession);
-    assert.equal(dirname(destinationSession), sessionDir);
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test("session continuation preserves a fresh source when switching fails", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-test-"));
-  try {
-    const sessionDir = join(root, "sessions");
-    const sourceManager = SessionManager.create("/repo", sessionDir);
-    sourceManager.appendSessionInfo("fresh session");
-    const sourceSession = sourceManager.getSessionFile();
-    assert.ok(sourceSession);
-    assert.equal(existsSync(sourceSession), false);
-
-    const continueSession = createSessionContinuator(forkSessionFromSnapshot);
-    await assert.rejects(
-      continueSession(
-        {
-          cwd: "/repo",
-          hasUI: true,
-          sessionManager: sourceManager,
-          async waitForIdle() {},
-          ui: {
-            async confirm() {
-              return true;
-            },
-            notify() {},
-          },
-          async switchSession() {
-            throw new Error("target runtime failed");
-          },
-        } as any,
-        { branch: "main", path: "/repo.main" },
-      ),
-      /target runtime failed/,
-    );
-
-    assert.equal(existsSync(sourceSession), true);
-    const sourceEntries = (await readFile(sourceSession, "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line));
-    assert.equal(sourceEntries[1].name, "fresh session");
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test("session continuation leaves Pi in place when confirmation is declined", async () => {
-  let forked = false;
-  let switched = false;
-  const notifications: Array<[string, string]> = [];
-  const continueSession = createSessionContinuator(() => {
-    forked = true;
-    return "/sessions/continued.jsonl";
-  });
-
-  const continued = await continueSession(
-    {
-      cwd: "/repo",
-      hasUI: true,
-      sessionManager: { getSessionFile: () => "/sessions/source.jsonl" },
-      async waitForIdle() {},
-      ui: {
-        async confirm() {
-          return false;
-        },
-        notify(message: string, level: string) {
-          notifications.push([message, level]);
-        },
-      },
-      async switchSession() {
-        switched = true;
-        return { cancelled: false };
-      },
-    } as any,
-    { branch: "feature/auth", path: "/repo.feature-auth" },
-  );
-
-  assert.equal(continued, false);
-  assert.equal(forked, false);
-  assert.equal(switched, false);
-  assert.deepEqual(notifications, [
-    [
-      "Session continuation cancelled.\nWorktree: /repo.feature-auth\nPi remains in /repo.",
-      "info",
-    ],
-  ]);
 });
 
 test("worktree tool renders native output for every action", async () => {
@@ -1022,6 +1281,7 @@ test("extension lazily discovers a worktree from stored repository identity", as
         command = definition;
       },
       registerTool() {},
+      sendMessage() {},
       appendEntry() {
         throw new Error("stored identity should not be appended again");
       },
@@ -1065,16 +1325,23 @@ test("extension lazily discovers a worktree from stored repository identity", as
       sessionManager: { getEntries: () => [identityEntry] },
     });
     await handlers.get("agent_end")?.({}, { cwd: source });
-    assert.equal(calls.at(-1)?.cwd, source);
 
     await command.handler("list", {
       cwd: source,
+      mode: "json",
       hasUI: false,
+      signal: undefined,
+      async waitForIdle() {},
+      sessionManager: {
+        getSessionFile: () => "/sessions/source.jsonl",
+        getEntries: () => [identityEntry],
+      },
       ui: { notify() {} },
     });
 
-    assert.equal(calls.at(-1)?.program, "wt");
-    assert.equal(calls.at(-1)?.cwd, main);
+    assert.ok(calls.some(({ program, cwd }) =>
+      program === "wt" && cwd === main,
+    ));
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1282,31 +1549,31 @@ test("extension exposes Worktrunk aliases under /wt and as an agent tool", async
 
     const commandContext = {
       cwd: root,
+      mode: "tui",
+      hasUI: true,
       signal: undefined,
+      sessionManager: {
+        getSessionFile: () => "/sessions/source.jsonl",
+        getEntries: () => [],
+      },
+      async waitForIdle() {},
       ui: {
         notify(message: string, level: string) {
           notifications.push({ message, level });
         },
       },
     };
-    await command.handler("", commandContext);
-    await command.handler(`land 42 "two words" ''`, commandContext);
+    await command.handler(`land 42 "two words"`, commandContext);
+    await command.handler("land 42 --go", commandContext);
 
-    assert.deepEqual(calls.at(-1), {
-      program: "wt",
-      args: ["land", "42", "two words", ""],
-      cwd: root,
-    });
-    assert.equal(notifications[0]?.level, "info");
-    assert.match(notifications[0]?.message ?? "", /\/wt land \[args\]/);
-    assert.deepEqual(notifications[1], {
-      message:
-        "Merged pull request 42\n✓ Removed feature worktree\n\n" +
-        "The alias removed Pi's working directory. Use " +
-        "`/wt continue <target>` to continue this session in an " +
-        "existing worktree.",
-      level: "info",
-    });
+    assert.ok(calls.some((call) =>
+      call.program === "wt" &&
+      call.args.join("\0") === ["land", "42", "two words"].join("\0") &&
+      call.cwd === root,
+    ));
+    assert.ok(notifications.some(({ message, level }) =>
+      level === "warning" && message.includes("no unique target"),
+    ));
   } finally {
     await rm(root, { recursive: true, force: true });
   }
