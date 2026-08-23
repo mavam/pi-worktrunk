@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { existsSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, resolve, sep } from "node:path";
@@ -38,7 +39,6 @@ type WorktreeItem = {
     path?: string;
     main?: boolean;
     current?: boolean;
-    previous?: boolean;
     changes?: Record<string, boolean | undefined>;
   };
   default_branch?: Relation;
@@ -58,15 +58,24 @@ type SessionTransitionDetails = {
   destinationSession: string;
 };
 type RepositoryIdentity = { commonDir: string; device: number; inode: number };
-type Invocation = { args: string[]; command?: string; commandArgs: string[] };
-type Execution = { result: WtResult; output: string; moved: boolean };
+type Invocation = {
+  args: string[];
+  command?: string;
+  commandIndex?: number;
+  commandArgs: string[];
+};
+type Execution = {
+  result: WtResult;
+  output: string;
+  moved: boolean;
+  canContinue: boolean;
+};
+type PendingContinuation = { key: string; nonce: string; expiresAt: number };
 
 const SESSION_TRANSITION_MESSAGE = "pi-worktrunk-session-transition";
-const CONTINUATION_MESSAGE = {
-  customType: "pi-worktrunk-continuation",
-  content: "Continue the original task in this worktree. Do not repeat the Worktrunk invocation.",
-  display: false,
-} as const;
+const CONTINUATION_MESSAGE_TYPE = "pi-worktrunk-continuation";
+const MAX_CONTINUATION_OUTPUT = 50_000;
+const CONTINUATION_ARG_PREFIX = "__pi_worktrunk_continuation=";
 const REPOSITORY_IDENTITY_ENTRY = "pi-worktrunk-repository";
 const SUBCOMMANDS = ["switch", "list", "remove", "merge", "step", "hook", "config"] as const;
 const WORKTRUNK_ALIAS_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
@@ -269,9 +278,34 @@ export function parseAliasArguments(input: string): string[] {
   if (started) args.push(current);
   return args;
 }
+const GLOBAL_OPTIONS_WITH_VALUES = new Set(["-C", "--config", "--config-set"]);
+
 export function parseWtInvocation(input: string): Invocation {
   const args = parseAliasArguments(input);
-  return { args, command: args[0], commandArgs: args.slice(1) };
+  let commandIndex: number | undefined;
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index];
+    if (GLOBAL_OPTIONS_WITH_VALUES.has(value)) {
+      index += 1;
+      continue;
+    }
+    if (
+      (value.startsWith("-C") && value !== "-C") ||
+      value.startsWith("--config=") ||
+      value.startsWith("--config-set=") ||
+      value.startsWith("-")
+    ) {
+      continue;
+    }
+    commandIndex = index;
+    break;
+  }
+  return {
+    args,
+    command: commandIndex === undefined ? undefined : args[commandIndex],
+    ...(commandIndex === undefined ? {} : { commandIndex }),
+    commandArgs: commandIndex === undefined ? [] : args.slice(commandIndex + 1),
+  };
 }
 function quoteArgument(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
@@ -283,6 +317,19 @@ function exactSwitchTarget(invocation: Invocation): string | undefined {
   if (invocation.command !== "switch" || invocation.commandArgs.length !== 1) return undefined;
   const value = invocation.commandArgs[0];
   return value.startsWith("-") ? undefined : value;
+}
+function sensitiveGlobalOption(args: readonly string[]): string | undefined {
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index];
+    if (value === "--") break;
+    if (
+      value === "-C" || value.startsWith("-C") ||
+      value === "--config" || value.startsWith("--config=") ||
+      value === "--config-set" || value.startsWith("--config-set=") ||
+      value === "-y" || value === "--yes"
+    ) return value;
+  }
+  return undefined;
 }
 
 function relationText(relation?: Relation): string { return `ahead ${relation?.ahead ?? 0}, behind ${relation?.behind ?? 0}`; }
@@ -325,8 +372,8 @@ function readSessionTrail(ctx: ExtensionCommandContext): SessionLocation[] {
   }
   return [];
 }
-function survivingTrail(trail: readonly SessionLocation[], worktrees: readonly WorktreeItem[], exclude?: string): SessionLocation[] {
-  return trail.filter((location) => (!exclude || canonicalPath(location.path) !== canonicalPath(exclude)) && itemForPath(worktrees, location.path));
+function survivingTrail(trail: readonly SessionLocation[], worktrees: readonly WorktreeItem[]): SessionLocation[] {
+  return trail.filter((location) => itemForPath(worktrees, location.path));
 }
 function recoveryTarget(trail: readonly SessionLocation[], worktrees: readonly WorktreeItem[]): { target?: WorktreeItem; trail: SessionLocation[] } {
   for (let index = trail.length - 1; index >= 0; index -= 1) {
@@ -388,7 +435,8 @@ export default function extension(pi: ExtensionAPI) {
   const execWt: RunWt = (args, options) => pi.exec("wt", args, options);
   let storedRepositoryIdentity: RepositoryIdentity | undefined;
   let aliases: WorktrunkAlias[] = [];
-  let continuationArgs: string | undefined;
+  let pendingContinuation: PendingContinuation | undefined;
+  let placementInFlight = false;
   const aliasNames = new Set<string>();
 
   async function readCommonDir(cwd: string, signal?: AbortSignal): Promise<string | undefined> {
@@ -429,7 +477,7 @@ export default function extension(pi: ExtensionAPI) {
       }
     }
     try {
-      const commonDir = await readCommonDir(ctx.cwd);
+      const commonDir = await readCommonDir(ctx.cwd, ctx.signal);
       if (!commonDir) return;
       const identity = repositoryIdentity(commonDir);
       if (!identity || sameRepositoryIdentity(identity, storedRepositoryIdentity)) return;
@@ -453,9 +501,25 @@ export default function extension(pi: ExtensionAPI) {
     else if (ctx.mode === "json") pi.sendMessage({ customType: "pi-worktrunk-command", content: message, display: true, details: { level } });
     else ctx.ui.notify(message, level);
   }
-  async function locationFor(item: WorktreeItem): Promise<SessionLocation> {
+  async function locationFor(item: WorktreeItem, signal?: AbortSignal): Promise<SessionLocation> {
     if (!item.worktree?.path) throw new WorktrunkError("The target worktree has no path.");
-    return worktreeLocation(item, item.worktree.path, await readCommonDir(item.worktree.path));
+    return worktreeLocation(item, item.worktree.path, await readCommonDir(item.worktree.path, signal));
+  }
+  function continuationMessage(invocation: Invocation, execution: Execution) {
+    const status = execution.result.code === 0 && !execution.result.killed
+      ? "completed successfully"
+      : "failed";
+    const output = execution.output
+      ? execution.output.slice(0, MAX_CONTINUATION_OUTPUT)
+      : "(no output)";
+    return {
+      customType: CONTINUATION_MESSAGE_TYPE,
+      content:
+        `Worktrunk invocation \`wt ${invocation.args.join(" ")}\` ${status} ` +
+        `(exit ${execution.result.code}).\n\n${output}\n\n` +
+        "Continue the original task in this worktree. Do not repeat the Worktrunk invocation.",
+      display: false,
+    } as const;
   }
   async function activate(
     ctx: ExtensionCommandContext,
@@ -463,31 +527,31 @@ export default function extension(pi: ExtensionAPI) {
     target: SessionLocation,
     trail: SessionLocation[],
     kind: SessionTransitionKind,
-    continuation: boolean,
+    continuation?: ReturnType<typeof continuationMessage>,
   ) {
     const destinationSession = createLinkedSession(ctx, source, target, trail, kind);
     const result = await ctx.switchSession(destinationSession, {
       withSession: async (nextCtx) => {
         nextCtx.ui.notify(`Session ${kind === "recovery" ? "recovered" : "moved"} from ${source.branch ?? source.path} to ${target.branch ?? target.path}.`, "info");
         if (continuation) {
-          await nextCtx.sendMessage(CONTINUATION_MESSAGE, { triggerTurn: true });
+          await nextCtx.sendMessage(continuation, { triggerTurn: true });
         }
       },
     });
     if (result.cancelled) throw new WorktrunkError(`Pi created ${destinationSession}, but session switching was cancelled.`);
   }
 
-  async function executeInvocation(invocation: Invocation, ctx: ExtensionCommandContext, continuation = false): Promise<Execution> {
+  async function executeInvocation(invocation: Invocation, ctx: ExtensionCommandContext, modelOrigin = false): Promise<Execution> {
     await ctx.waitForIdle();
     const interactive = ctx.mode !== "print" && ctx.mode !== "json";
-    if (isBareCommand(invocation, "list") && interactive && ctx.hasUI) {
+    if (!modelOrigin && isBareCommand(invocation, "list") && interactive && ctx.hasUI) {
       const worktrees = await client.list(ctx.cwd, ctx.signal);
       if (!worktrees.length) ctx.ui.notify("No worktrees found.", "info");
       else {
         const selected = await chooseWorktree(ctx, "Select a worktree to inspect", worktrees);
         if (selected) ctx.ui.notify(formatWorktreeStatus(selected), "info");
       }
-      return { result: { code: 0 }, output: "", moved: false };
+      return { result: { code: 0 }, output: "", moved: false, canContinue: true };
     }
 
     const trail = readSessionTrail(ctx);
@@ -496,9 +560,11 @@ export default function extension(pi: ExtensionAPI) {
     const source = worktreeLocation(sourceItem, ctx.cwd, storedRepositoryIdentity?.commonDir);
     let args = invocation.args;
     let selected: WorktreeItem | undefined;
-    if (isBareCommand(invocation, "switch") && interactive && ctx.hasUI) {
+    if (!modelOrigin && isBareCommand(invocation, "switch") && interactive && ctx.hasUI) {
       selected = await chooseWorktree(ctx, "Select a worktree", before.filter((item) => item.worktree?.path));
-      if (!selected?.worktree?.path) return { result: { code: 0 }, output: "", moved: false };
+      if (!selected?.worktree?.path) {
+        return { result: { code: 0 }, output: "", moved: false, canContinue: true };
+      }
       args = ["switch", selected.worktree.path];
     }
 
@@ -507,38 +573,58 @@ export default function extension(pi: ExtensionAPI) {
     catch (error) { result = { code: -1, stderr: error instanceof Error ? error.message : String(error) }; }
     const output = [result.stdout?.trimEnd(), result.stderr?.trimEnd()].filter(Boolean).join("\n");
     if (output) emit(ctx, output, result.code === 0 ? "info" : "error");
+    const base: Execution = { result, output, moved: false, canContinue: existsSync(ctx.cwd) };
+    const continuation = modelOrigin ? continuationMessage(invocation, base) : undefined;
 
     const after = await safeList(ctx.cwd, ctx.signal);
     if (!existsSync(ctx.cwd)) {
       const recovery = recoveryTarget(trail, after);
       if (!recovery.target?.worktree?.path) {
         emit(ctx, "Pi's worktree was removed and no surviving worktree was found.", "error");
-        return { result, output, moved: false };
+        return { ...base, canContinue: false };
       }
       if (!interactive || !ctx.sessionManager.getSessionFile()) {
         emit(ctx, `The current worktree was removed. Continue from ${recovery.target.worktree.path}.`, "warning");
-        return { result, output, moved: false };
+        return { ...base, canContinue: false };
       }
-      try { await activate(ctx, source, await locationFor(recovery.target), recovery.trail, "recovery", continuation); }
-      catch (error) { emit(ctx, error instanceof Error ? error.message : String(error), "error"); }
-      return { result, output, moved: true };
+      try {
+        await activate(
+          ctx,
+          source,
+          await locationFor(recovery.target, ctx.signal),
+          recovery.trail,
+          "recovery",
+          continuation,
+        );
+        return { ...base, moved: true, canContinue: true };
+      } catch (error) {
+        emit(ctx, error instanceof Error ? error.message : String(error), "error");
+        return { ...base, canContinue: false };
+      }
     }
-    if (result.code !== 0 || result.killed) return { result, output, moved: false };
+    if (result.code !== 0 || result.killed) return base;
 
     let target = selected ?? uniqueCreatedTarget(before, after);
     if (!target) {
       const exact = exactSwitchTarget(invocation);
       if (exact) target = resolveWorktree(after, exact);
     }
-    if (!target?.worktree?.path) return { result, output, moved: false };
-    if (canonicalPath(target.worktree.path) === canonicalPath(ctx.cwd)) return { result, output, moved: false };
-    if (!interactive || !ctx.sessionManager.getSessionFile()) return { result, output, moved: false };
+    if (!target?.worktree?.path) return base;
+    if (canonicalPath(target.worktree.path) === canonicalPath(ctx.cwd)) return base;
+    if (!interactive || !ctx.sessionManager.getSessionFile()) return base;
     try {
-      await activate(ctx, source, await locationFor(target), nextTrail(survivingTrail(trail, after), source), "move", continuation);
-      return { result, output, moved: true };
+      await activate(
+        ctx,
+        source,
+        await locationFor(target, ctx.signal),
+        nextTrail(survivingTrail(trail, after), source),
+        "move",
+        continuation,
+      );
+      return { ...base, moved: true };
     } catch (error) {
       emit(ctx, error instanceof Error ? error.message : String(error), "error");
-      return { result, output, moved: false };
+      return base;
     }
   }
 
@@ -550,17 +636,43 @@ export default function extension(pi: ExtensionAPI) {
       return [...SUBCOMMANDS, ...aliasNames].filter((name) => name.startsWith(value)).map((name) => ({ value: name, label: name }));
     },
     async handler(input, ctx) {
+      let modelOrigin = false;
       try {
-        const invocation = parseWtInvocation(input);
+        const received = parseWtInvocation(input);
+        const marker = received.args.at(-1);
+        const nonce = marker?.startsWith(CONTINUATION_ARG_PREFIX)
+          ? marker.slice(CONTINUATION_ARG_PREFIX.length)
+          : undefined;
+        const args = nonce ? received.args.slice(0, -1) : received.args;
+        const invocation = parseWtInvocation(args.map(quoteArgument).join(" "));
         const key = JSON.stringify(invocation.args);
-        const continuation = continuationArgs === key;
-        if (continuation) continuationArgs = undefined;
-        const execution = await executeInvocation(invocation, ctx, continuation);
-        if (continuation && !execution.moved) {
-          pi.sendMessage(CONTINUATION_MESSAGE, { triggerTurn: true });
+        if (
+          nonce &&
+          pendingContinuation?.nonce === nonce &&
+          pendingContinuation.expiresAt <= Date.now()
+        ) {
+          pendingContinuation = undefined;
+          placementInFlight = false;
+        }
+        modelOrigin = Boolean(
+          nonce &&
+          pendingContinuation &&
+          pendingContinuation.expiresAt > Date.now() &&
+          pendingContinuation.nonce === nonce &&
+          pendingContinuation.key === key,
+        );
+        if (nonce && !modelOrigin) {
+          throw new WorktrunkError("Invalid or expired model continuation token.");
+        }
+        if (modelOrigin) pendingContinuation = undefined;
+        const execution = await executeInvocation(invocation, ctx, modelOrigin);
+        if (modelOrigin && !execution.moved && execution.canContinue) {
+          pi.sendMessage(continuationMessage(invocation, execution), { triggerTurn: true });
         }
       } catch (error) {
         emit(ctx, error instanceof Error ? error.message : String(error), "error");
+      } finally {
+        if (modelOrigin) placementInFlight = false;
       }
     },
   });
@@ -582,20 +694,68 @@ export default function extension(pi: ExtensionAPI) {
       executionMode: "sequential",
       async execute(_id, params, _signal, _update, ctx) {
         const args = [...params.args];
-        const alias = args[0];
-        if (aliasNames.has(alias)) {
-          if (!ctx.hasUI) throw new WorktrunkError("Running a Worktrunk alias requires interactive or RPC mode so the user can confirm the exact command.");
-          const metadata = aliases.find((candidate) => candidate.name === alias);
-          const confirmed = await ctx.ui.confirm(
-            `Run Worktrunk alias ${alias}?`,
-            [`Command: wt ${args.map(quoteArgument).join(" ")}`, ...(metadata?.steps.length ? [`Pipeline: ${metadata.steps.join(" -> ")}`] : []), "", "This alias may perform destructive or external actions."].join("\n"),
-          );
-          if (!confirmed) return { content: [{ type: "text" as const, text: `Cancelled Worktrunk alias ${alias}.` }], details: { args, cancelled: true }, terminate: true };
+        const invocation = parseWtInvocation(args.map(quoteArgument).join(" "));
+        if (isBareCommand(invocation, "switch")) {
+          throw new WorktrunkError("The worktrunk tool requires an explicit target for `wt switch`.");
         }
-        continuationArgs = JSON.stringify(args);
-        pi.sendUserMessage(`/wt ${args.map(quoteArgument).join(" ")}`, { deliverAs: "followUp", expandPromptTemplates: true });
+        if (pendingContinuation && pendingContinuation.expiresAt <= Date.now()) {
+          pendingContinuation = undefined;
+          placementInFlight = false;
+        }
+        if (placementInFlight) {
+          throw new WorktrunkError("Another model-triggered Worktrunk invocation is still pending.");
+        }
+
+        const alias = invocation.command;
+        const sensitive = sensitiveGlobalOption(args);
+        const unknown = alias !== undefined &&
+          !SUBCOMMANDS.includes(alias as (typeof SUBCOMMANDS)[number]) &&
+          !aliasNames.has(alias);
+        const requiresConfirmation = Boolean(
+          (alias && aliasNames.has(alias)) || sensitive || unknown,
+        );
+        if (requiresConfirmation) {
+          if (!ctx.hasUI) {
+            throw new WorktrunkError("This Worktrunk invocation requires interactive or RPC mode so the user can confirm the exact command.");
+          }
+          const metadata = aliases.find((candidate) => candidate.name === alias);
+          const reason = metadata
+            ? `Configured alias: ${alias}`
+            : sensitive
+              ? `Sensitive global option: ${sensitive}`
+              : `Unrecognized command: ${alias}`;
+          const confirmed = await ctx.ui.confirm(
+            "Run Worktrunk command?",
+            [
+              `Command: wt ${args.map(quoteArgument).join(" ")}`,
+              reason,
+              ...(metadata?.steps.length ? [`Pipeline: ${metadata.steps.join(" -> ")}`] : []),
+              "",
+              "This command may perform destructive or external actions.",
+            ].join("\n"),
+          );
+          if (!confirmed) {
+            return {
+              content: [{ type: "text" as const, text: `Cancelled wt ${args.join(" ")}.` }],
+              details: { args, cancelled: true },
+              terminate: true,
+            };
+          }
+        }
+        const nonce = randomUUID();
+        placementInFlight = true;
+        pendingContinuation = {
+          key: JSON.stringify(args),
+          nonce,
+          expiresAt: Date.now() + 5 * 60_000,
+        };
+        const marker = `${CONTINUATION_ARG_PREFIX}${nonce}`;
+        pi.sendUserMessage(
+          `/wt ${[...args, marker].map(quoteArgument).join(" ")}`,
+          { deliverAs: "followUp", expandPromptTemplates: true },
+        );
         return {
-          content: [{ type: "text" as const, text: `Queued wt ${args.join(" ")}. Worktrunk will run after this turn, and work will continue in the destination session when it moves.` }],
+          content: [{ type: "text" as const, text: `Queued wt ${args.join(" ")}. Worktrunk will run after this turn, and the result will be returned before work continues.` }],
           details: { args },
           terminate: true,
         };

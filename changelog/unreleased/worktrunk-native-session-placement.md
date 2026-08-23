@@ -16,6 +16,6 @@ The `/wt` command now accepts Worktrunk's CLI unchanged and moves the Pi session
 /wt land
 ```
 
-The model uses the same interface through `{"args":["switch","--create","fix/parser"]}`. After a move, it resumes the original task in the linked destination session. Configured aliases appear in the tool description and still require confirmation.
+The model uses the same interface through `{"args":["switch","--create","fix/parser"]}`. After a move, it reports Worktrunk's result and resumes the original task in the linked destination session. Configured aliases appear in the tool description. Aliases and options that can change or bypass Worktrunk approval settings require confirmation.
 
 This replaces the `--go`, `--stay`, and `--fork` placement flags, placement environment variables, fork launchers, and the previous structured model tools. Commands with no unique destination stay in the current session. If a command removes the current worktree, Pi recovers in a surviving worktree.

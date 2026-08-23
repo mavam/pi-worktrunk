@@ -46,7 +46,9 @@ Configured aliases pass directly through `/wt`:
 /wt deploy staging
 ```
 
-Worktrunk continues to enforce project-command approvals.
+Worktrunk continues to enforce project-command approvals. Model calls that run
+aliases, unknown commands, configuration overrides, another working directory,
+or approval-bypass options require Pi confirmation first.
 
 ## 🚦 Status markers
 
@@ -67,9 +69,10 @@ array and passes every item directly to `wt` without shell expansion:
 ```
 
 The tool description lists repository aliases and their pipeline labels when
-Worktrunk provides that metadata. Alias calls require confirmation. Commands
-that move to another worktree stop the old model turn, switch to a linked
-session, and resume the task there.
+Worktrunk provides that metadata. Alias calls and sensitive global options
+require confirmation. Commands that move to another worktree stop the old model
+turn, switch to a linked session, report Worktrunk's result, and resume the task
+there.
 
 ## 🧰 Requirements
 
@@ -80,8 +83,9 @@ session, and resume the task there.
 
 - Pi stays put rather than choosing between several destinations.
 - Recovery takes precedence when a command removes the current worktree.
-- Worktrunk retains control of hooks, approvals, dirty-worktree checks, force
-  flags, branch deletion, and command errors.
+- Worktrunk retains control of hooks, dirty-worktree checks, force flags, branch
+  deletion, and command errors. Pi confirms model calls that could alter or
+  bypass Worktrunk approval settings.
 - Session movement preserves the source session.
 
 ## 🧹 Uninstall

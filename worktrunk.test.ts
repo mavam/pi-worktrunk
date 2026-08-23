@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -10,6 +10,7 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import extension, {
   MARKERS,
   createMarkerUpdater,
+  createWorktrunkClient,
   markerArgs,
   parseAliasArguments,
   parseWtInvocation,
@@ -30,12 +31,20 @@ test("argument parsing preserves Worktrunk argv", () => {
   assert.deepEqual(parseWtInvocation("switch --create fix/parser"), {
     args: ["switch", "--create", "fix/parser"],
     command: "switch",
+    commandIndex: 0,
     commandArgs: ["--create", "fix/parser"],
   });
   assert.deepEqual(parseWtInvocation("--config custom.toml list"), {
     args: ["--config", "custom.toml", "list"],
-    command: "--config",
-    commandArgs: ["custom.toml", "list"],
+    command: "list",
+    commandIndex: 2,
+    commandArgs: [],
+  });
+  assert.deepEqual(parseWtInvocation("-v switch main"), {
+    args: ["-v", "switch", "main"],
+    command: "switch",
+    commandIndex: 1,
+    commandArgs: ["main"],
   });
   assert.throws(() => parseAliasArguments("'unfinished"), /unterminated quote/);
 });
@@ -66,6 +75,7 @@ function baseApi(options: {
   commands: Map<string, any>;
   tools: Map<string, any>;
   sent?: Array<{ text: string; options: any }>;
+  messages?: Array<{ message: any; options: any }>;
   renderer?: Map<string, any>;
 }) {
   return {
@@ -74,7 +84,7 @@ function baseApi(options: {
     registerTool(definition: any) { options.tools.set(definition.name, definition); },
     registerMessageRenderer(name: string, renderer: any) { options.renderer?.set(name, renderer); },
     appendEntry() {},
-    sendMessage() {},
+    sendMessage(message: any, sendOptions: any) { options.messages?.push({ message, options: sendOptions }); },
     sendUserMessage(text: string, sendOptions: any) { options.sent?.push({ text, options: sendOptions }); },
     exec: options.exec,
   } as any;
@@ -121,16 +131,71 @@ test("tool confirms aliases and queues exact argv for the shared command", async
     },
   }));
   await handlers.get("session_start")({}, { cwd: process.cwd(), signal: undefined, sessionManager: { getEntries: () => [] } });
-  const result = await tools.get("worktrunk").execute("call", { args: ["land", "two words"] }, undefined, undefined, {
+  const result = await tools.get("worktrunk").execute("call", { args: ["-v", "land", "two words"] }, undefined, undefined, {
     cwd: process.cwd(), hasUI: true,
     ui: { async confirm(_title: string, message: string) { confirmations.push(message); return true; } },
   });
   assert.equal(result.terminate, true);
   assert.match(confirmations[0], /Pipeline: verify/);
-  assert.deepEqual(sent, [{
-    text: "/wt 'land' 'two words'",
-    options: { deliverAs: "followUp", expandPromptTemplates: true },
-  }]);
+  assert.match(sent[0].text, /^\/wt '-v' 'land' 'two words' '__pi_worktrunk_continuation=[^']+'$/);
+  assert.deepEqual(sent[0].options, {
+    deliverAs: "followUp",
+    expandPromptTemplates: true,
+  });
+  await assert.rejects(
+    tools.get("worktrunk").execute("second", { args: ["list"] }, undefined, undefined, {
+      cwd: process.cwd(), hasUI: true, ui: {},
+    }),
+    /still pending/,
+  );
+});
+
+test("tool confirms sensitive global configuration overrides", async () => {
+  const handlers = new Map<string, any>();
+  const commands = new Map<string, any>();
+  const tools = new Map<string, any>();
+  let confirmations = 0;
+  extension(baseApi({
+    handlers, commands, tools,
+    async exec(program, args) {
+      if (program === "git") return { code: 1, stdout: "", stderr: "" };
+      if (args[0] === "--help") return { code: 0, stdout: "" };
+      return { code: 0, stdout: "" };
+    },
+  }));
+  await handlers.get("session_start")({}, {
+    cwd: process.cwd(), signal: undefined, sessionManager: { getEntries: () => [] },
+  });
+  const result = await tools.get("worktrunk").execute(
+    "call",
+    { args: ["--config-set", "aliases.pwn=echo", "pwn"] },
+    undefined,
+    undefined,
+    {
+      cwd: process.cwd(), hasUI: true,
+      ui: { async confirm() { confirmations += 1; return false; } },
+    },
+  );
+  assert.equal(confirmations, 1);
+  assert.equal(result.details.cancelled, true);
+});
+
+test("Worktrunk client handles relocated lists and failures", async () => {
+  const calls: string[][] = [];
+  const client = createWorktrunkClient(async (args) => {
+    calls.push(args);
+    return {
+      code: 0,
+      relocated: true,
+      stdout: list([{ branch: "main", worktree: { path: "/repo", current: true } }]),
+    };
+  });
+  const items = await client.list("/removed");
+  assert.equal(items[0].worktree?.current, false);
+  assert.deepEqual(calls[0], ["--config-set", "list.json-schema=2", "list", "--format=json"]);
+
+  const failing = createWorktrunkClient(async () => ({ code: 1, stderr: "needs approval" }));
+  await assert.rejects(failing.list(process.cwd()), /wt list failed: needs approval.*approvals add/s);
 });
 
 test("create-and-switch moves and resumes model work", async () => {
@@ -169,7 +234,7 @@ test("create-and-switch moves and resumes model work", async () => {
     const sessionCtx = { cwd: source, signal: undefined, sessionManager: manager };
     await handlers.get("session_start")({}, sessionCtx);
     await tools.get("worktrunk").execute("call", { args: ["switch", "--create", "fix/parser"] }, undefined, undefined, { cwd: source, hasUI: true, ui: {} });
-    await commands.get("wt").handler("'switch' '--create' 'fix/parser'", {
+    await commands.get("wt").handler(sent[0].text.slice(4), {
       ...sessionCtx, mode: "tui", hasUI: true,
       async waitForIdle() {},
       async switchSession(path: string, options: any) {
@@ -186,6 +251,79 @@ test("create-and-switch moves and resumes model work", async () => {
     assert.equal(SessionManager.open(switched, sessions).getCwd(), realpathSync(target));
     assert.equal(continuation.message.display, false);
     assert.equal(continuation.opts.triggerTurn, true);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("model list bypasses the picker and receives Worktrunk output", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-list-"));
+  const source = join(root, "repo");
+  await mkdir(join(source, ".git"), { recursive: true });
+  const handlers = new Map<string, any>();
+  const commands = new Map<string, any>();
+  const tools = new Map<string, any>();
+  const messages: Array<{ message: any; options: any }> = [];
+  const sent: Array<{ text: string; options: any }> = [];
+  try {
+    extension(baseApi({ handlers, commands, tools, messages, sent, async exec(program, args) {
+      if (program === "git") return { code: 0, stdout: `${join(source, ".git")}\n` };
+      if (args[0] === "--help") return { code: 0, stdout: "" };
+      if (args.length === 1 && args[0] === "list") return { code: 0, stdout: "main worktree" };
+      if (args.includes("list")) return { code: 0, stdout: wtList(source) };
+      return { code: 0, stdout: "" };
+    } }));
+    const manager = SessionManager.create(source, join(root, "sessions"));
+    manager.appendSessionInfo("test");
+    await handlers.get("session_start")({}, { cwd: source, sessionManager: manager });
+    await tools.get("worktrunk").execute("call", { args: ["list"] }, undefined, undefined, {
+      cwd: source, hasUI: true, ui: {},
+    });
+    await commands.get("wt").handler(sent[0].text.slice(4), {
+      cwd: source, mode: "tui", hasUI: true, sessionManager: manager,
+      async waitForIdle() {},
+      ui: {
+        notify() {},
+        async select() { throw new Error("model list must not open a picker"); },
+      },
+    });
+    assert.match(messages.at(-1)?.message.content ?? "", /completed successfully.*main worktree/s);
+    assert.equal(messages.at(-1)?.options.triggerTurn, true);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("JSON mode runs exact argv without replacing the session", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-json-"));
+  const source = join(root, "repo");
+  const target = join(root, "repo.main");
+  await mkdir(join(source, ".git"), { recursive: true });
+  await mkdir(target);
+  const handlers = new Map<string, any>();
+  const commands = new Map<string, any>();
+  const tools = new Map<string, any>();
+  const messages: Array<{ message: any; options: any }> = [];
+  let switches = 0;
+  const calls: string[][] = [];
+  try {
+    extension(baseApi({ handlers, commands, tools, messages, async exec(program, args) {
+      if (program === "git") return { code: 0, stdout: `${join(source, ".git")}\n` };
+      if (args[0] === "--help") return { code: 0, stdout: "" };
+      if (args.includes("list")) return { code: 0, stdout: list([
+        { branch: "feature", worktree: { path: source, current: true } },
+        { branch: "main", worktree: { path: target, main: true } },
+      ]) };
+      calls.push([...args]);
+      return { code: 0, stdout: "switched" };
+    } }));
+    const manager = SessionManager.create(source, join(root, "sessions"));
+    manager.appendSessionInfo("test");
+    await handlers.get("session_start")({}, { cwd: source, sessionManager: manager });
+    await commands.get("wt").handler("-v switch main", {
+      cwd: source, mode: "json", hasUI: false, sessionManager: manager,
+      async waitForIdle() {}, async switchSession() { switches += 1; return { cancelled: false }; },
+      ui: { notify() {} },
+    });
+    assert.deepEqual(calls.filter((args) => args[0] !== "config"), [["-v", "switch", "main"]]);
+    assert.equal(switches, 0);
+    assert.equal(messages.at(-1)?.message.content, "switched");
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
@@ -222,6 +360,65 @@ test("ambiguous creations stay in the source session", async () => {
       ui: { notify() {} },
     });
     assert.equal(switches, 0);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("a failed command that removes the cwd recovers and resumes with the failure", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-recovery-"));
+  const main = join(root, "repo");
+  const source = join(root, "repo.feature");
+  const common = join(main, ".git");
+  const sessions = join(root, "sessions");
+  await mkdir(common, { recursive: true });
+  await mkdir(source);
+  const manager = SessionManager.create(source, sessions);
+  manager.appendSessionInfo("test");
+  const handlers = new Map<string, any>();
+  const commands = new Map<string, any>();
+  const tools = new Map<string, any>();
+  let switched = "";
+  let continuation: any;
+  const sent: Array<{ text: string; options: any }> = [];
+  try {
+    extension(baseApi({ handlers, commands, tools, sent, async exec(program, args) {
+      if (program === "git" && args.includes("worktree")) {
+        return { code: 0, stdout: `worktree ${main}\0HEAD aaaa\0branch refs/heads/main\0\0` };
+      }
+      if (program === "git") return { code: 0, stdout: `${common}\n` };
+      if (args[0] === "--help") return { code: 0, stdout: "Aliases:\n  land\n" };
+      if (args[0] === "config" && args[1] === "show") return { code: 0, stdout: "{}" };
+      if (args.includes("list")) return { code: 0, stdout: list([
+        { branch: "main", worktree: { path: main, main: true, current: !existsSync(source) } },
+        ...(existsSync(source) ? [{ branch: "feature", worktree: { path: source, current: true } }] : []),
+      ]) };
+      if (args[0] === "land") {
+        await rm(source, { recursive: true, force: true });
+        return { code: 1, stderr: "land failed after cleanup" };
+      }
+      return { code: 0, stdout: "" };
+    } }));
+    await handlers.get("session_start")({}, { cwd: source, signal: undefined, sessionManager: manager });
+    await tools.get("worktrunk").execute("call", { args: ["land"] }, undefined, undefined, {
+      cwd: source, hasUI: true, ui: { async confirm() { return true; } },
+    });
+    await commands.get("wt").handler(sent[0].text.slice(4), {
+      cwd: source, mode: "tui", hasUI: true, sessionManager: manager,
+      async waitForIdle() {},
+      async switchSession(path: string, options: any) {
+        switched = path;
+        await options.withSession({
+          ui: { notify() {} },
+          async sendMessage(message: any, sendOptions: any) {
+            continuation = { message, options: sendOptions };
+          },
+        });
+        return { cancelled: false };
+      },
+      ui: { notify() {} },
+    });
+    assert.equal(SessionManager.open(switched, sessions).getCwd(), realpathSync(main));
+    assert.match(continuation.message.content, /failed \(exit 1\).*land failed after cleanup/s);
+    assert.equal(continuation.options.triggerTurn, true);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
