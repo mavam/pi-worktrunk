@@ -1,5 +1,5 @@
 ---
-title: Worktrunk-native session placement
+title: Automatic Worktrunk session placement
 type: breaking
 authors:
   - mavam
@@ -8,12 +8,14 @@ prs:
 created: 2026-08-22T10:01:09.482363Z
 ---
 
-The `/wt` command now accepts the full Worktrunk CLI and can place the active Pi session after any command:
+The `/wt` command now accepts Worktrunk's CLI unchanged and moves the Pi session automatically when a command identifies one destination:
 
 ```text
-/wt switch --create fix-parser
-/wt switch fix-parser --go
+/wt switch main
+/wt switch --create fix/parser
 /wt land
 ```
 
-Use `--go` to follow a command's target, `--stay` to remain in the current worktree, or `--fork` to create a second resumable session. Pi tracks previous worktrees for `/wt switch -` and recovers automatically when a merge, removal, hook, or alias deletes the current worktree.
+The model uses the same interface through `{"args":["switch","--create","fix/parser"]}`. After a move, it resumes the original task in the linked destination session. Configured aliases appear in the tool description and still require confirmation.
+
+This replaces the `--go`, `--stay`, and `--fork` placement flags, placement environment variables, fork launchers, and the previous structured model tools. Commands with no unique destination stay in the current session. If a command removes the current worktree, Pi recovers in a surviving worktree.
