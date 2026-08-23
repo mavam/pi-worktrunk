@@ -248,7 +248,14 @@ test("create-and-switch moves and resumes model work", async () => {
       ui: { notify() {} },
     });
     assert.ok(wtCalls.some((args) => args.join("\0") === ["switch", "--create", "fix/parser"].join("\0")));
-    assert.equal(SessionManager.open(switched, sessions).getCwd(), realpathSync(target));
+    const destination = SessionManager.open(switched, sessions);
+    assert.equal(destination.getCwd(), realpathSync(target));
+    const transition = destination.getEntries().at(-1);
+    assert.equal(transition?.type, "custom_message");
+    if (transition?.type === "custom_message") {
+      assert.equal(transition.customType, "pi-worktrunk");
+      assert.equal(transition.content, "");
+    }
     assert.equal(continuation.message.display, false);
     assert.equal(continuation.opts.triggerTurn, true);
   } finally { await rm(root, { recursive: true, force: true }); }
@@ -428,7 +435,8 @@ test("transition renderer keeps move and recovery variants", () => {
   const tools = new Map<string, any>();
   const renderers = new Map<string, any>();
   extension(baseApi({ handlers, commands, tools, renderer: renderers, async exec() { return { code: 0, stdout: "" }; } }));
-  const renderer = renderers.get("pi-worktrunk-session-transition");
+  const renderer = renderers.get("pi-worktrunk");
+  assert.ok(renderers.has("pi-worktrunk-session-transition"));
   const theme = { fg(_color: string, text: string) { return text; }, bold(text: string) { return text; } };
   const message = { details: {
     kind: "move",

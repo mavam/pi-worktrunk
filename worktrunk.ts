@@ -72,7 +72,8 @@ type Execution = {
 };
 type PendingContinuation = { key: string; nonce: string; expiresAt: number };
 
-const SESSION_TRANSITION_MESSAGE = "pi-worktrunk-session-transition";
+const SESSION_TRANSITION_MESSAGE = "pi-worktrunk";
+const LEGACY_SESSION_TRANSITION_MESSAGE = "pi-worktrunk-session-transition";
 const CONTINUATION_MESSAGE_TYPE = "pi-worktrunk-continuation";
 const MAX_CONTINUATION_OUTPUT = 50_000;
 const CONTINUATION_ARG_PREFIX = "__pi_worktrunk_continuation=";
@@ -365,7 +366,12 @@ async function chooseWorktree(ctx: ExtensionCommandContext, title: string, items
 
 function readSessionTrail(ctx: ExtensionCommandContext): SessionLocation[] {
   for (const entry of [...ctx.sessionManager.getEntries()].reverse()) {
-    if (entry.type !== "custom_message" || entry.customType !== SESSION_TRANSITION_MESSAGE || !entry.details || typeof entry.details !== "object") continue;
+    if (
+      entry.type !== "custom_message" ||
+      ![SESSION_TRANSITION_MESSAGE, LEGACY_SESSION_TRANSITION_MESSAGE].includes(entry.customType) ||
+      !entry.details ||
+      typeof entry.details !== "object"
+    ) continue;
     const trail = (entry.details as { trail?: unknown }).trail;
     if (Array.isArray(trail)) return trail.filter((value): value is SessionLocation =>
       Boolean(value && typeof value === "object" && typeof value.path === "string" && (typeof value.branch === "string" || value.branch === null)));
@@ -399,7 +405,7 @@ function createLinkedSession(ctx: ExtensionCommandContext, source: SessionLocati
   const destination = SessionManager.open(destinationSession, targetSessionDir);
   destination.appendCustomMessageEntry(
     SESSION_TRANSITION_MESSAGE,
-    `The Pi session ${kind === "recovery" ? "recovered" : "moved"} from ${source.path} to ${target.path}. Use the destination worktree for subsequent file operations. Previous absolute paths may be stale.`,
+    "",
     true,
     { kind, source, target, trail, sourceSession, destinationSession } satisfies SessionTransitionDetails,
   );
@@ -417,7 +423,8 @@ function gitWorktreePaths(output: string): string[] {
 }
 
 export default function extension(pi: ExtensionAPI) {
-  pi.registerMessageRenderer?.(SESSION_TRANSITION_MESSAGE, (message, { expanded, outputPad }, theme) => {
+  const renderTransition: Parameters<ExtensionAPI["registerMessageRenderer"]>[1] =
+    (message, { expanded, outputPad }, theme) => {
     const details = message.details as Partial<SessionTransitionDetails> | undefined;
     const recovery = details?.kind === "recovery";
     const source = details?.source;
@@ -430,7 +437,9 @@ export default function extension(pi: ExtensionAPI) {
       if (expanded) text += `\n\n  ${theme.fg("dim", "From")}  ${compactPath(source.path)}\n  ${theme.fg("dim", "To")}    ${compactPath(target.path)}`;
     }
     return new Text(text, outputPad, 0);
-  });
+  };
+  pi.registerMessageRenderer?.(SESSION_TRANSITION_MESSAGE, renderTransition);
+  pi.registerMessageRenderer?.(LEGACY_SESSION_TRANSITION_MESSAGE, renderTransition);
 
   const execWt: RunWt = (args, options) => pi.exec("wt", args, options);
   let storedRepositoryIdentity: RepositoryIdentity | undefined;
