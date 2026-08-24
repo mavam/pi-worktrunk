@@ -11,8 +11,15 @@ import {
   type SessionEntry,
   type SessionHeader,
 } from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+
+import {
+  WORKTRUNK_COMMANDS,
+  WORKTRUNK_REFERENCE,
+  WORKTRUNK_REFERENCE_VERSION,
+} from "./worktrunk-reference.ts";
 
 export const MARKERS = { working: "🤖", waiting: "💬" } as const;
 
@@ -47,6 +54,7 @@ type WorktreeItem = {
 };
 type WorktreeList = { schema: number; items: WorktreeItem[] };
 export type WorktrunkAlias = { name: string; steps: string[] };
+export type WorktrunkCommand = { name: string; description: string };
 type SessionLocation = { branch: string | null; path: string; commonDir?: string };
 type SessionTransitionKind = "move" | "recovery";
 type SessionTransitionDetails = {
@@ -78,7 +86,6 @@ const CONTINUATION_MESSAGE_TYPE = "pi-worktrunk-continuation";
 const MAX_CONTINUATION_OUTPUT = 50_000;
 const CONTINUATION_ARG_PREFIX = "__pi_worktrunk_continuation=";
 const REPOSITORY_IDENTITY_ENTRY = "pi-worktrunk-repository";
-const SUBCOMMANDS = ["switch", "list", "remove", "merge", "step", "hook", "config"] as const;
 const WORKTRUNK_ALIAS_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 
 class WorktrunkError extends Error {
@@ -219,6 +226,20 @@ export function createWorktrunkClient(runWt: RunWt) {
   };
 }
 
+export function parseWorktrunkCommands(output: string): WorktrunkCommand[] {
+  const commands: WorktrunkCommand[] = [];
+  let inCommands = false;
+  for (const line of output.split("\n")) {
+    if (!inCommands) { if (line.trim() === "Commands:") inCommands = true; continue; }
+    if (!line.trim() || !/^\s/.test(line)) break;
+    const match = line.match(/^\s+([A-Za-z0-9][A-Za-z0-9_-]*)\s{2,}(.+?)\s*$/);
+    if (match && !commands.some(({ name }) => name === match[1])) {
+      commands.push({ name: match[1], description: match[2] });
+    }
+  }
+  return commands;
+}
+
 export function parseWorktrunkAliasNames(output: string): string[] {
   const aliases: string[] = [];
   let inAliases = false;
@@ -333,6 +354,44 @@ function sensitiveGlobalOption(args: readonly string[]): string | undefined {
   return undefined;
 }
 
+function positionalCommandArgs(invocation: Invocation): string[] {
+  const result: string[] = [];
+  for (let index = 0; index < invocation.commandArgs.length; index += 1) {
+    const value = invocation.commandArgs[index];
+    if (GLOBAL_OPTIONS_WITH_VALUES.has(value)) { index += 1; continue; }
+    if (
+      (value.startsWith("-C") && value !== "-C") ||
+      value.startsWith("--config=") ||
+      value.startsWith("--config-set=") ||
+      value.startsWith("-")
+    ) continue;
+    result.push(value);
+  }
+  return result;
+}
+
+export function administrativeCommandReason(invocation: Invocation): string | undefined {
+  const path = positionalCommandArgs(invocation);
+  if (invocation.command === "hook") {
+    return path.length && path[0] !== "show" ? `hook ${path[0]}` : undefined;
+  }
+  if (invocation.command !== "config" || !path.length) return undefined;
+  const [group, action, operation] = path;
+  if (group === "show") return undefined;
+  if (group === "alias" && (!action || action === "show" || action === "dry-run")) return undefined;
+  if (group === "approvals" && (!action || action === "list")) return undefined;
+  if (group === "shell" && (!action || action === "init" || action === "show-theme")) return undefined;
+  if (group === "state") {
+    if (!action || action === "get") return undefined;
+    if (action === "cache" && (!operation || operation === "get")) return undefined;
+    if (action === "default-branch" && (!operation || operation === "get")) return undefined;
+    if (action === "logs" && (!operation || operation === "get" || operation === "profile")) return undefined;
+    if (action === "marker" && (!operation || operation === "get")) return undefined;
+    if (action === "vars" && (!operation || operation === "get" || operation === "list")) return undefined;
+  }
+  return `config ${path.slice(0, 3).join(" ")}`;
+}
+
 function relationText(relation?: Relation): string { return `ahead ${relation?.ahead ?? 0}, behind ${relation?.behind ?? 0}`; }
 function changeText(item: WorktreeItem): string {
   const changes = item.worktree?.changes ?? {};
@@ -444,8 +503,11 @@ export default function extension(pi: ExtensionAPI) {
   const execWt: RunWt = (args, options) => pi.exec("wt", args, options);
   let storedRepositoryIdentity: RepositoryIdentity | undefined;
   let aliases: WorktrunkAlias[] = [];
+  let installedCommands: WorktrunkCommand[] = [];
+  let installedVersion: string | undefined;
   let pendingContinuation: PendingContinuation | undefined;
   let placementInFlight = false;
+  const commandNames = new Set<string>(WORKTRUNK_COMMANDS);
   const aliasNames = new Set<string>();
 
   async function readCommonDir(cwd: string, signal?: AbortSignal): Promise<string | undefined> {
@@ -494,14 +556,22 @@ export default function extension(pi: ExtensionAPI) {
       pi.appendEntry(REPOSITORY_IDENTITY_ENTRY, identity);
     } catch {}
   }
-  async function discoverAliases(ctx: ExtensionContext) {
+  async function discoverCommandsAndAliases(ctx: ExtensionContext) {
     aliases = [];
+    installedCommands = [];
+    installedVersion = undefined;
     aliasNames.clear();
     let help: WtResult;
     try { help = await runWt(["--help"], { cwd: ctx.cwd, cwdMode: "repository-read" }); } catch { return; }
     if (help.code !== 0) return;
+    installedCommands = parseWorktrunkCommands(help.stdout ?? "");
+    for (const { name } of installedCommands) commandNames.add(name);
     for (const name of parseWorktrunkAliasNames(help.stdout ?? "")) aliasNames.add(name);
     aliases = [...aliasNames].map((name) => ({ name, steps: [] }));
+    try {
+      const version = await runWt(["--version"], { cwd: ctx.cwd, cwdMode: "repository-read" });
+      if (version.code === 0) installedVersion = version.stdout?.trim();
+    } catch {}
     if (!aliases.length) return;
     try { aliases = parseWorktrunkAliasMetadata([...aliasNames], await client.settings(ctx.cwd, ctx.signal)); } catch {}
   }
@@ -642,7 +712,7 @@ export default function extension(pi: ExtensionAPI) {
     getArgumentCompletions(prefix) {
       const value = prefix.trimStart();
       if (/\s/.test(value)) return null;
-      return [...SUBCOMMANDS, ...aliasNames].filter((name) => name.startsWith(value)).map((name) => ({ value: name, label: name }));
+      return [...commandNames, ...aliasNames].filter((name) => name.startsWith(value)).map((name) => ({ value: name, label: name }));
     },
     async handler(input, ctx) {
       let modelOrigin = false;
@@ -687,22 +757,67 @@ export default function extension(pi: ExtensionAPI) {
   });
 
   function registerTool() {
-    const catalog = aliases.length
-      ? `\n\nConfigured aliases:\n${aliases.map(({ name, steps }) => `- ${name}: ${steps.length ? steps.join(" -> ") : "no pipeline metadata available"}`).join("\n")}`
+    const additionalCommands = installedCommands.filter(({ name }) =>
+      !(WORKTRUNK_COMMANDS as readonly string[]).includes(name));
+    const installedCatalog = additionalCommands.length
+      ? `\n\nAdditional commands reported by the installed Worktrunk:\n${additionalCommands.map(({ name, description }) => [
+        `- ${name}: ${description}`,
+        `  Help: ${JSON.stringify({ command: name, args: ["--help"] })}`,
+      ].join("\n")).join("\n")}`
       : "";
+    const aliasCatalog = aliases.length
+      ? `\n\nConfigured aliases:\n${aliases.map(({ name, steps }) => [
+        `- ${name}: ${steps.length ? steps.join(" -> ") : "no pipeline metadata available"}`,
+        `  Example: ${JSON.stringify({ command: name, args: [] })}`,
+      ].join("\n")).join("\n")}`
+      : "";
+    const commandChoices = [...new Set([...commandNames, ...aliasNames])];
+    const versions = installedVersion && installedVersion !== WORKTRUNK_REFERENCE_VERSION
+      ? ` Bundled reference: ${WORKTRUNK_REFERENCE_VERSION}; installed: ${installedVersion}.`
+      : ` Reference version: ${WORKTRUNK_REFERENCE_VERSION}.`;
     pi.registerTool({
       name: "worktrunk",
       label: "Worktrunk",
-      description: `Run a Worktrunk command. Arguments pass directly to wt without shell expansion. Commands that identify one destination move the Pi session there.${catalog}`,
-      promptSnippet: "Run Worktrunk commands and continue in a uniquely identified destination worktree",
+      description: `Run Worktrunk commands using the complete built-in command, option, and example reference below. The command's remaining arguments pass directly to wt without shell expansion. Commands that identify one destination move the Pi session there.${versions}\n\n${WORKTRUNK_REFERENCE}${installedCatalog}${aliasCatalog}`,
+      promptSnippet: "Run Worktrunk commands using the complete built-in command, option, and example reference",
       promptGuidelines: [
-        "Use worktrunk for Worktrunk commands. Pass the exact wt arguments without a leading wt.",
+        "Use worktrunk for Worktrunk commands. Select a command and its remaining arguments from the worktrunk reference and examples.",
         "The worktrunk tool moves the session automatically when Worktrunk identifies one destination.",
       ],
-      parameters: Type.Object({ args: Type.Array(Type.String(), { minItems: 1 }) }, { additionalProperties: false }),
+      parameters: Type.Object({
+        command: StringEnum(commandChoices, {
+          description: "Built-in Worktrunk command or configured alias to run.",
+        }),
+        args: Type.Optional(Type.Array(Type.String(), {
+          description: "Arguments after the Worktrunk command, in CLI order and without shell expansion.",
+        })),
+      }, { additionalProperties: false }),
+      prepareArguments(value): { command: string; args?: string[] } {
+        const input = value as { command?: unknown; args?: unknown } | undefined;
+        if (typeof input?.command === "string") {
+          return {
+            command: input.command,
+            ...(Array.isArray(input.args) ? { args: input.args.filter((arg): arg is string => typeof arg === "string") } : {}),
+          };
+        }
+        if (Array.isArray(input?.args) && input.args.every((arg) => typeof arg === "string")) {
+          const legacyArgs = input.args as string[];
+          const invocation = parseWtInvocation(legacyArgs.map(quoteArgument).join(" "));
+          if (invocation.command !== undefined && invocation.commandIndex !== undefined) {
+            return {
+              command: invocation.command,
+              args: [
+                ...legacyArgs.slice(0, invocation.commandIndex),
+                ...legacyArgs.slice(invocation.commandIndex + 1),
+              ],
+            };
+          }
+        }
+        return value as { command: string; args?: string[] };
+      },
       executionMode: "sequential",
       async execute(_id, params, _signal, _update, ctx) {
-        const args = [...params.args];
+        const args = [params.command, ...(params.args ?? [])];
         const invocation = parseWtInvocation(args.map(quoteArgument).join(" "));
         if (isBareCommand(invocation, "switch")) {
           throw new WorktrunkError("The worktrunk tool requires an explicit target for `wt switch`.");
@@ -717,11 +832,12 @@ export default function extension(pi: ExtensionAPI) {
 
         const alias = invocation.command;
         const sensitive = sensitiveGlobalOption(args);
+        const administrative = administrativeCommandReason(invocation);
         const unknown = alias !== undefined &&
-          !SUBCOMMANDS.includes(alias as (typeof SUBCOMMANDS)[number]) &&
+          !commandNames.has(alias) &&
           !aliasNames.has(alias);
         const requiresConfirmation = Boolean(
-          (alias && aliasNames.has(alias)) || sensitive || unknown,
+          (alias && aliasNames.has(alias)) || sensitive || administrative || unknown,
         );
         if (requiresConfirmation) {
           if (!ctx.hasUI) {
@@ -732,7 +848,9 @@ export default function extension(pi: ExtensionAPI) {
             ? `Configured alias: ${alias}`
             : sensitive
               ? `Sensitive global option: ${sensitive}`
-              : `Unrecognized command: ${alias}`;
+              : administrative
+                ? `Administrative command: ${administrative}`
+                : `Unrecognized command: ${alias}`;
           const confirmed = await ctx.ui.confirm(
             "Run Worktrunk command?",
             [
@@ -771,7 +889,8 @@ export default function extension(pi: ExtensionAPI) {
       },
       renderCall(args, theme) {
         let text = theme.fg("toolTitle", theme.bold("Worktrunk"));
-        if (args.args?.length) text += ` ${theme.fg("accent", args.args.join(" "))}`;
+        const invocation = [args.command, ...(args.args ?? [])].filter((value): value is string => typeof value === "string");
+        if (invocation.length) text += ` ${theme.fg("accent", invocation.join(" "))}`;
         return new Text(text, 0, 0);
       },
       renderResult(result) {
@@ -783,7 +902,7 @@ export default function extension(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     await restoreRepositoryIdentity(ctx);
-    await discoverAliases(ctx);
+    await discoverCommandsAndAliases(ctx);
     registerTool();
     await tracker.markWaiting(ctx.cwd);
   });

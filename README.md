@@ -47,8 +47,9 @@ Configured aliases pass directly through `/wt`:
 ```
 
 Worktrunk continues to enforce project-command approvals. Model calls that run
-aliases, unknown commands, configuration overrides, another working directory,
-or approval-bypass options require Pi confirmation first.
+aliases, hooks, administrative configuration changes, configuration overrides,
+another working directory, or approval-bypass options require Pi confirmation
+first.
 
 ## 🚦 Status markers
 
@@ -61,18 +62,20 @@ The extension maps Pi lifecycle events to Worktrunk branch markers:
 
 ## 🧰 Agent tool
 
-The extension registers one `worktrunk` tool. It accepts a non-empty argument
-array and passes every item directly to `wt` without shell expansion:
+The extension registers one `worktrunk` tool. Its `command` field enumerates the
+built-in commands and configured aliases. Its optional `args` array passes the
+remaining arguments directly to `wt` without shell expansion:
 
 ```json
-{ "args": ["switch", "--create", "fix/parser"] }
+{ "command": "switch", "args": ["--create", "fix/parser"] }
 ```
 
-The tool description lists repository aliases and their pipeline labels when
-Worktrunk provides that metadata. Alias calls and sensitive global options
-require confirmation. Commands that move to another worktree stop the old model
-turn, switch to a linked session, report Worktrunk's result, and resume the task
-there.
+The tool description includes the generated built-in command tree, meaningful
+options, arguments, and canonical examples. Commands added by a newer installed
+Worktrunk version and repository aliases are discovered at startup. Alias calls,
+hook execution, administrative changes, and sensitive global options require
+confirmation. Commands that move to another worktree stop the old model turn,
+switch to a linked session, report Worktrunk's result, and resume the task there.
 
 ## 🧰 Requirements
 

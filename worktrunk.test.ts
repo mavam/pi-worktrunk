@@ -7,8 +7,10 @@ import test from "node:test";
 
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 
+import { WORKTRUNK_REFERENCE_VERSION } from "./worktrunk-reference.ts";
 import extension, {
   MARKERS,
+  administrativeCommandReason,
   createMarkerUpdater,
   createWorktrunkClient,
   markerArgs,
@@ -16,6 +18,7 @@ import extension, {
   parseWtInvocation,
   parseWorktrunkAliasMetadata,
   parseWorktrunkAliasNames,
+  parseWorktrunkCommands,
 } from "./worktrunk.ts";
 
 const list = (items: unknown[]) => JSON.stringify({ schema: 2, items });
@@ -49,8 +52,20 @@ test("argument parsing preserves Worktrunk argv", () => {
   assert.throws(() => parseAliasArguments("'unfinished"), /unterminated quote/);
 });
 
-test("alias discovery includes pipeline metadata", () => {
-  assert.deepEqual(parseWorktrunkAliasNames("Aliases:\n  land, deploy\n\nOptions:"), ["land", "deploy"]);
+test("command and alias discovery parse Worktrunk help", () => {
+  const help = [
+    "Commands:",
+    "  switch  Switch worktrees",
+    "  doctor  Diagnose setup",
+    "",
+    "Aliases:",
+    "  land, deploy",
+  ].join("\n");
+  assert.deepEqual(parseWorktrunkCommands(help), [
+    { name: "switch", description: "Switch worktrees" },
+    { name: "doctor", description: "Diagnose setup" },
+  ]);
+  assert.deepEqual(parseWorktrunkAliasNames(help), ["land", "deploy"]);
   assert.deepEqual(parseWorktrunkAliasMetadata(["land", "deploy"], JSON.stringify({
     user: { config: { aliases: { land: [{ "merge-pr": "gh pr merge" }, { verify: "bun test" }] } } },
     project: { config: { aliases: { land: [{ cleanup: "wt remove" }], deploy: "make deploy" } } },
@@ -98,7 +113,15 @@ test("session start registers one repository-specific tool", async () => {
     handlers, commands, tools,
     async exec(program, args) {
       if (program === "git") return { code: 1, stdout: "", stderr: "" };
-      if (args.join(" ") === "--help") return { code: 0, stdout: "Aliases:\n  land, deploy\n" };
+      if (args.join(" ") === "--help") return { code: 0, stdout: [
+        "Commands:",
+        "  switch  Switch worktrees",
+        "  doctor  Diagnose setup",
+        "",
+        "Aliases:",
+        "  land, deploy",
+      ].join("\n") };
+      if (args.join(" ") === "--version") return { code: 0, stdout: "wt v-next\n" };
       if (args.join(" ") === "config show --format=json") return { code: 0, stdout: JSON.stringify({
         project: { config: { aliases: { land: [{ "merge-pr": "x" }, { verify: "x" }, { cleanup: "x" }], deploy: "x" } } },
       }) };
@@ -109,10 +132,31 @@ test("session start registers one repository-specific tool", async () => {
   assert.deepEqual([...commands.keys()], ["wt"]);
   assert.deepEqual([...tools.keys()], ["worktrunk"]);
   const tool = tools.get("worktrunk");
-  assert.deepEqual(tool.parameters.required, ["args"]);
-  assert.equal(tool.parameters.properties.args.minItems, 1);
+  assert.deepEqual(tool.parameters.required, ["command"]);
+  assert.deepEqual(tool.parameters.properties.command.enum, [
+    "switch", "list", "remove", "merge", "step", "hook", "config", "doctor", "land", "deploy",
+  ]);
+  assert.match(tool.parameters.properties.args.description, /Arguments after the Worktrunk command/);
+  assert.match(tool.description, /Worktrunk command reference/);
+  assert.match(tool.description, /switch — Switch to a worktree; create if needed/);
+  assert.match(tool.description, /- -c, --create: Create a new branch/);
+  assert.match(tool.description, /\{"command":"switch","args":\["--create","new-feature"\]\}/);
+  assert.match(tool.description, /config state marker — Branch markers/);
+  assert.ok(tool.description.includes(`Bundled reference: ${WORKTRUNK_REFERENCE_VERSION}; installed: wt v-next`));
+  assert.match(tool.description, /doctor: Diagnose setup/);
   assert.match(tool.description, /land: merge-pr -> verify -> cleanup/);
-  assert.match(tool.description, /deploy: no pipeline metadata available/);
+  assert.match(tool.description, /Example: \{"command":"deploy","args":\[\]\}/);
+  assert.match(tool.promptSnippet, /complete built-in command, option, and example reference/);
+  assert.ok(tool.promptGuidelines.some((guideline: string) => guideline.includes("reference and examples")));
+  assert.deepEqual(tool.prepareArguments({ args: ["switch", "--create", "fix/parser"] }), {
+    command: "switch", args: ["--create", "fix/parser"],
+  });
+  assert.deepEqual(tool.prepareArguments({ args: ["-v", "land", "two words"] }), {
+    command: "land", args: ["-v", "two words"],
+  });
+  assert.deepEqual(commands.get("wt").getArgumentCompletions("sw"), [
+    { value: "switch", label: "switch" },
+  ]);
 });
 
 test("tool confirms aliases and queues exact argv for the shared command", async () => {
@@ -131,30 +175,39 @@ test("tool confirms aliases and queues exact argv for the shared command", async
     },
   }));
   await handlers.get("session_start")({}, { cwd: process.cwd(), signal: undefined, sessionManager: { getEntries: () => [] } });
-  const result = await tools.get("worktrunk").execute("call", { args: ["-v", "land", "two words"] }, undefined, undefined, {
+  const result = await tools.get("worktrunk").execute("call", { command: "land", args: ["-v", "two words"] }, undefined, undefined, {
     cwd: process.cwd(), hasUI: true,
     ui: { async confirm(_title: string, message: string) { confirmations.push(message); return true; } },
   });
   assert.equal(result.terminate, true);
   assert.match(confirmations[0], /Pipeline: verify/);
-  assert.match(sent[0].text, /^\/wt '-v' 'land' 'two words' '__pi_worktrunk_continuation=[^']+'$/);
+  assert.match(sent[0].text, /^\/wt 'land' '-v' 'two words' '__pi_worktrunk_continuation=[^']+'$/);
   assert.deepEqual(sent[0].options, {
     deliverAs: "followUp",
     expandPromptTemplates: true,
   });
   await assert.rejects(
-    tools.get("worktrunk").execute("second", { args: ["list"] }, undefined, undefined, {
+    tools.get("worktrunk").execute("second", { command: "list" }, undefined, undefined, {
       cwd: process.cwd(), hasUI: true, ui: {},
     }),
     /still pending/,
   );
 });
 
+test("administrative command detection distinguishes reads from mutations", () => {
+  assert.equal(administrativeCommandReason(parseWtInvocation("hook show")), undefined);
+  assert.equal(administrativeCommandReason(parseWtInvocation("hook pre-merge test")), "hook pre-merge");
+  assert.equal(administrativeCommandReason(parseWtInvocation("config approvals list")), undefined);
+  assert.equal(administrativeCommandReason(parseWtInvocation("config approvals clear --global")), "config approvals clear");
+  assert.equal(administrativeCommandReason(parseWtInvocation("config state marker get")), undefined);
+  assert.equal(administrativeCommandReason(parseWtInvocation("config state marker set busy")), "config state marker set");
+});
+
 test("tool confirms sensitive global configuration overrides", async () => {
   const handlers = new Map<string, any>();
   const commands = new Map<string, any>();
   const tools = new Map<string, any>();
-  let confirmations = 0;
+  const confirmations: string[] = [];
   extension(baseApi({
     handlers, commands, tools,
     async exec(program, args) {
@@ -168,16 +221,29 @@ test("tool confirms sensitive global configuration overrides", async () => {
   });
   const result = await tools.get("worktrunk").execute(
     "call",
-    { args: ["--config-set", "aliases.pwn=echo", "pwn"] },
+    { command: "list", args: ["--config-set", "list.full=true"] },
     undefined,
     undefined,
     {
       cwd: process.cwd(), hasUI: true,
-      ui: { async confirm() { confirmations += 1; return false; } },
+      ui: { async confirm(_title: string, message: string) { confirmations.push(message); return false; } },
     },
   );
-  assert.equal(confirmations, 1);
   assert.equal(result.details.cancelled, true);
+  assert.match(confirmations[0], /Sensitive global option: --config-set/);
+
+  const administrative = await tools.get("worktrunk").execute(
+    "administrative",
+    { command: "config", args: ["approvals", "clear"] },
+    undefined,
+    undefined,
+    {
+      cwd: process.cwd(), hasUI: true,
+      ui: { async confirm(_title: string, message: string) { confirmations.push(message); return false; } },
+    },
+  );
+  assert.equal(administrative.details.cancelled, true);
+  assert.match(confirmations[1], /Administrative command: config approvals clear/);
 });
 
 test("Worktrunk client handles relocated lists and failures", async () => {
@@ -233,7 +299,7 @@ test("create-and-switch moves and resumes model work", async () => {
     }));
     const sessionCtx = { cwd: source, signal: undefined, sessionManager: manager };
     await handlers.get("session_start")({}, sessionCtx);
-    await tools.get("worktrunk").execute("call", { args: ["switch", "--create", "fix/parser"] }, undefined, undefined, { cwd: source, hasUI: true, ui: {} });
+    await tools.get("worktrunk").execute("call", { command: "switch", args: ["--create", "fix/parser"] }, undefined, undefined, { cwd: source, hasUI: true, ui: {} });
     await commands.get("wt").handler(sent[0].text.slice(4), {
       ...sessionCtx, mode: "tui", hasUI: true,
       async waitForIdle() {},
@@ -281,7 +347,7 @@ test("model list bypasses the picker and receives Worktrunk output", async () =>
     const manager = SessionManager.create(source, join(root, "sessions"));
     manager.appendSessionInfo("test");
     await handlers.get("session_start")({}, { cwd: source, sessionManager: manager });
-    await tools.get("worktrunk").execute("call", { args: ["list"] }, undefined, undefined, {
+    await tools.get("worktrunk").execute("call", { command: "list" }, undefined, undefined, {
       cwd: source, hasUI: true, ui: {},
     });
     await commands.get("wt").handler(sent[0].text.slice(4), {
@@ -328,7 +394,7 @@ test("JSON mode runs exact argv without replacing the session", async () => {
       async waitForIdle() {}, async switchSession() { switches += 1; return { cancelled: false }; },
       ui: { notify() {} },
     });
-    assert.deepEqual(calls.filter((args) => args[0] !== "config"), [["-v", "switch", "main"]]);
+    assert.deepEqual(calls.filter((args) => args[0] !== "config" && args[0] !== "--version"), [["-v", "switch", "main"]]);
     assert.equal(switches, 0);
     assert.equal(messages.at(-1)?.message.content, "switched");
   } finally { await rm(root, { recursive: true, force: true }); }
@@ -405,7 +471,7 @@ test("a failed command that removes the cwd recovers and resumes with the failur
       return { code: 0, stdout: "" };
     } }));
     await handlers.get("session_start")({}, { cwd: source, signal: undefined, sessionManager: manager });
-    await tools.get("worktrunk").execute("call", { args: ["land"] }, undefined, undefined, {
+    await tools.get("worktrunk").execute("call", { command: "land" }, undefined, undefined, {
       cwd: source, hasUI: true, ui: { async confirm() { return true; } },
     });
     await commands.get("wt").handler(sent[0].text.slice(4), {

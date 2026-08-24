@@ -5,6 +5,7 @@
   "type": "module",
   "files": [
     "worktrunk.ts",
+    "worktrunk-reference.ts",
     "README.md",
     "LICENSE"
   ],
@@ -29,12 +30,20 @@
     "node": ">=24.0.0"
   },
   "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
   "scripts": {
-    "test": "node --test --experimental-strip-types *.test.ts"
+    "check": "tsc --noEmit && node --test --experimental-strip-types *.test.ts scripts/*.test.ts && bun run check-reference",
+    "check-reference": "node --experimental-strip-types scripts/generate-worktrunk-reference.ts --check",
+    "generate-reference": "node --experimental-strip-types scripts/generate-worktrunk-reference.ts",
+    "test": "node --test --experimental-strip-types *.test.ts scripts/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
   },
   "publishConfig": {
     "access": "public"
