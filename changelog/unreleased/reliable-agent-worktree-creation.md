@@ -3,6 +3,8 @@ title: Complete Worktrunk command guidance
 type: change
 authors:
   - mavam
+prs:
+  - 12
 created: 2026-08-24T12:25:16.370655Z
 ---
 
