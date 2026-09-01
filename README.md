@@ -46,10 +46,9 @@ Configured aliases pass directly through `/wt`:
 /wt deploy staging
 ```
 
-Worktrunk continues to enforce project-command approvals. Model calls that run
-aliases, hooks, administrative configuration changes, configuration overrides,
-another working directory, or approval-bypass options require Pi confirmation
-first.
+Model calls run configured aliases and other Worktrunk commands without an
+additional Pi confirmation. Worktrunk continues to enforce its own safety checks
+and project-command approvals.
 
 ## 🚦 Status markers
 
@@ -72,10 +71,10 @@ remaining arguments directly to `wt` without shell expansion:
 
 The tool description includes the generated built-in command tree, meaningful
 options, arguments, and canonical examples. Commands added by a newer installed
-Worktrunk version and repository aliases are discovered at startup. Alias calls,
-hook execution, administrative changes, and sensitive global options require
-confirmation. Commands that move to another worktree stop the old model turn,
-switch to a linked session, report Worktrunk's result, and resume the task there.
+Worktrunk version and repository aliases are discovered at startup. Agent calls
+run without an additional Pi confirmation. Commands that move to another
+worktree stop the old model turn, switch to a linked session, report Worktrunk's
+result, and resume the task there.
 
 ## 🧰 Requirements
 
@@ -86,9 +85,8 @@ switch to a linked session, report Worktrunk's result, and resume the task there
 
 - Pi stays put rather than choosing between several destinations.
 - Recovery takes precedence when a command removes the current worktree.
-- Worktrunk retains control of hooks, dirty-worktree checks, force flags, branch
-  deletion, and command errors. Pi confirms model calls that could alter or
-  bypass Worktrunk approval settings.
+- Worktrunk retains control of hooks, project-command approvals, dirty-worktree
+  checks, force flags, branch deletion, and command errors.
 - Session movement preserves the source session.
 
 ## 📄 License

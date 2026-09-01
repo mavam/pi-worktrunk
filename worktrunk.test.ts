@@ -10,7 +10,6 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { WORKTRUNK_REFERENCE_VERSION } from "./worktrunk-reference.ts";
 import extension, {
   MARKERS,
-  administrativeCommandReason,
   createMarkerUpdater,
   createWorktrunkClient,
   markerArgs,
@@ -159,12 +158,11 @@ test("session start registers one repository-specific tool", async () => {
   ]);
 });
 
-test("tool confirms aliases and queues exact argv for the shared command", async () => {
+test("tool queues aliases without confirmation", async () => {
   const handlers = new Map<string, any>();
   const commands = new Map<string, any>();
   const tools = new Map<string, any>();
   const sent: Array<{ text: string; options: any }> = [];
-  const confirmations: string[] = [];
   extension(baseApi({
     handlers, commands, tools, sent,
     async exec(program, args) {
@@ -176,11 +174,9 @@ test("tool confirms aliases and queues exact argv for the shared command", async
   }));
   await handlers.get("session_start")({}, { cwd: process.cwd(), signal: undefined, sessionManager: { getEntries: () => [] } });
   const result = await tools.get("worktrunk").execute("call", { command: "land", args: ["-v", "two words"] }, undefined, undefined, {
-    cwd: process.cwd(), hasUI: true,
-    ui: { async confirm(_title: string, message: string) { confirmations.push(message); return true; } },
+    cwd: process.cwd(), hasUI: false, ui: {},
   });
   assert.equal(result.terminate, true);
-  assert.match(confirmations[0], /Pipeline: verify/);
   assert.match(sent[0].text, /^\/wt 'land' '-v' 'two words' '__pi_worktrunk_continuation=[^']+'$/);
   assert.deepEqual(sent[0].options, {
     deliverAs: "followUp",
@@ -188,62 +184,10 @@ test("tool confirms aliases and queues exact argv for the shared command", async
   });
   await assert.rejects(
     tools.get("worktrunk").execute("second", { command: "list" }, undefined, undefined, {
-      cwd: process.cwd(), hasUI: true, ui: {},
+      cwd: process.cwd(), hasUI: false, ui: {},
     }),
     /still pending/,
   );
-});
-
-test("administrative command detection distinguishes reads from mutations", () => {
-  assert.equal(administrativeCommandReason(parseWtInvocation("hook show")), undefined);
-  assert.equal(administrativeCommandReason(parseWtInvocation("hook pre-merge test")), "hook pre-merge");
-  assert.equal(administrativeCommandReason(parseWtInvocation("config approvals list")), undefined);
-  assert.equal(administrativeCommandReason(parseWtInvocation("config approvals clear --global")), "config approvals clear");
-  assert.equal(administrativeCommandReason(parseWtInvocation("config state marker get")), undefined);
-  assert.equal(administrativeCommandReason(parseWtInvocation("config state marker set busy")), "config state marker set");
-});
-
-test("tool confirms sensitive global configuration overrides", async () => {
-  const handlers = new Map<string, any>();
-  const commands = new Map<string, any>();
-  const tools = new Map<string, any>();
-  const confirmations: string[] = [];
-  extension(baseApi({
-    handlers, commands, tools,
-    async exec(program, args) {
-      if (program === "git") return { code: 1, stdout: "", stderr: "" };
-      if (args[0] === "--help") return { code: 0, stdout: "" };
-      return { code: 0, stdout: "" };
-    },
-  }));
-  await handlers.get("session_start")({}, {
-    cwd: process.cwd(), signal: undefined, sessionManager: { getEntries: () => [] },
-  });
-  const result = await tools.get("worktrunk").execute(
-    "call",
-    { command: "list", args: ["--config-set", "list.full=true"] },
-    undefined,
-    undefined,
-    {
-      cwd: process.cwd(), hasUI: true,
-      ui: { async confirm(_title: string, message: string) { confirmations.push(message); return false; } },
-    },
-  );
-  assert.equal(result.details.cancelled, true);
-  assert.match(confirmations[0], /Sensitive global option: --config-set/);
-
-  const administrative = await tools.get("worktrunk").execute(
-    "administrative",
-    { command: "config", args: ["approvals", "clear"] },
-    undefined,
-    undefined,
-    {
-      cwd: process.cwd(), hasUI: true,
-      ui: { async confirm(_title: string, message: string) { confirmations.push(message); return false; } },
-    },
-  );
-  assert.equal(administrative.details.cancelled, true);
-  assert.match(confirmations[1], /Administrative command: config approvals clear/);
 });
 
 test("Worktrunk client handles relocated lists and failures", async () => {
@@ -472,7 +416,7 @@ test("a failed command that removes the cwd recovers and resumes with the failur
     } }));
     await handlers.get("session_start")({}, { cwd: source, signal: undefined, sessionManager: manager });
     await tools.get("worktrunk").execute("call", { command: "land" }, undefined, undefined, {
-      cwd: source, hasUI: true, ui: { async confirm() { return true; } },
+      cwd: source, hasUI: false, ui: {},
     });
     await commands.get("wt").handler(sent[0].text.slice(4), {
       cwd: source, mode: "tui", hasUI: true, sessionManager: manager,

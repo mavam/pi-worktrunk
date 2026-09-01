@@ -340,58 +340,6 @@ function exactSwitchTarget(invocation: Invocation): string | undefined {
   const value = invocation.commandArgs[0];
   return value.startsWith("-") ? undefined : value;
 }
-function sensitiveGlobalOption(args: readonly string[]): string | undefined {
-  for (let index = 0; index < args.length; index += 1) {
-    const value = args[index];
-    if (value === "--") break;
-    if (
-      value === "-C" || value.startsWith("-C") ||
-      value === "--config" || value.startsWith("--config=") ||
-      value === "--config-set" || value.startsWith("--config-set=") ||
-      value === "-y" || value === "--yes"
-    ) return value;
-  }
-  return undefined;
-}
-
-function positionalCommandArgs(invocation: Invocation): string[] {
-  const result: string[] = [];
-  for (let index = 0; index < invocation.commandArgs.length; index += 1) {
-    const value = invocation.commandArgs[index];
-    if (GLOBAL_OPTIONS_WITH_VALUES.has(value)) { index += 1; continue; }
-    if (
-      (value.startsWith("-C") && value !== "-C") ||
-      value.startsWith("--config=") ||
-      value.startsWith("--config-set=") ||
-      value.startsWith("-")
-    ) continue;
-    result.push(value);
-  }
-  return result;
-}
-
-export function administrativeCommandReason(invocation: Invocation): string | undefined {
-  const path = positionalCommandArgs(invocation);
-  if (invocation.command === "hook") {
-    return path.length && path[0] !== "show" ? `hook ${path[0]}` : undefined;
-  }
-  if (invocation.command !== "config" || !path.length) return undefined;
-  const [group, action, operation] = path;
-  if (group === "show") return undefined;
-  if (group === "alias" && (!action || action === "show" || action === "dry-run")) return undefined;
-  if (group === "approvals" && (!action || action === "list")) return undefined;
-  if (group === "shell" && (!action || action === "init" || action === "show-theme")) return undefined;
-  if (group === "state") {
-    if (!action || action === "get") return undefined;
-    if (action === "cache" && (!operation || operation === "get")) return undefined;
-    if (action === "default-branch" && (!operation || operation === "get")) return undefined;
-    if (action === "logs" && (!operation || operation === "get" || operation === "profile")) return undefined;
-    if (action === "marker" && (!operation || operation === "get")) return undefined;
-    if (action === "vars" && (!operation || operation === "get" || operation === "list")) return undefined;
-  }
-  return `config ${path.slice(0, 3).join(" ")}`;
-}
-
 function relationText(relation?: Relation): string { return `ahead ${relation?.ahead ?? 0}, behind ${relation?.behind ?? 0}`; }
 function changeText(item: WorktreeItem): string {
   const changes = item.worktree?.changes ?? {};
@@ -816,7 +764,7 @@ export default function extension(pi: ExtensionAPI) {
         return value as { command: string; args?: string[] };
       },
       executionMode: "sequential",
-      async execute(_id, params, _signal, _update, ctx) {
+      async execute(_id, params, _signal, _update, _ctx) {
         const args = [params.command, ...(params.args ?? [])];
         const invocation = parseWtInvocation(args.map(quoteArgument).join(" "));
         if (isBareCommand(invocation, "switch")) {
@@ -830,45 +778,6 @@ export default function extension(pi: ExtensionAPI) {
           throw new WorktrunkError("Another model-triggered Worktrunk invocation is still pending.");
         }
 
-        const alias = invocation.command;
-        const sensitive = sensitiveGlobalOption(args);
-        const administrative = administrativeCommandReason(invocation);
-        const unknown = alias !== undefined &&
-          !commandNames.has(alias) &&
-          !aliasNames.has(alias);
-        const requiresConfirmation = Boolean(
-          (alias && aliasNames.has(alias)) || sensitive || administrative || unknown,
-        );
-        if (requiresConfirmation) {
-          if (!ctx.hasUI) {
-            throw new WorktrunkError("This Worktrunk invocation requires interactive or RPC mode so the user can confirm the exact command.");
-          }
-          const metadata = aliases.find((candidate) => candidate.name === alias);
-          const reason = metadata
-            ? `Configured alias: ${alias}`
-            : sensitive
-              ? `Sensitive global option: ${sensitive}`
-              : administrative
-                ? `Administrative command: ${administrative}`
-                : `Unrecognized command: ${alias}`;
-          const confirmed = await ctx.ui.confirm(
-            "Run Worktrunk command?",
-            [
-              `Command: wt ${args.map(quoteArgument).join(" ")}`,
-              reason,
-              ...(metadata?.steps.length ? [`Pipeline: ${metadata.steps.join(" -> ")}`] : []),
-              "",
-              "This command may perform destructive or external actions.",
-            ].join("\n"),
-          );
-          if (!confirmed) {
-            return {
-              content: [{ type: "text" as const, text: `Cancelled wt ${args.join(" ")}.` }],
-              details: { args, cancelled: true },
-              terminate: true,
-            };
-          }
-        }
         const nonce = randomUUID();
         placementInFlight = true;
         pendingContinuation = {
