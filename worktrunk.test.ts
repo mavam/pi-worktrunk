@@ -5,7 +5,8 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
+import { createAgentSession, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 
 import { WORKTRUNK_REFERENCE_VERSION } from "./worktrunk-reference.ts";
 import extension, {
@@ -188,6 +189,165 @@ test("tool queues aliases without confirmation", async () => {
     }),
     /still pending/,
   );
+});
+
+test("non-interactive tools run Worktrunk before the session exits", async () => {
+  const handlers = new Map<string, any>();
+  const commands = new Map<string, any>();
+  const tools = new Map<string, any>();
+  const sent: Array<{ text: string; options: any }> = [];
+  const calls: string[][] = [];
+  let abortCalls = 0;
+  extension(baseApi({
+    handlers, commands, tools, sent,
+    async exec(program, args, options) {
+      if (program === "git") return { code: 1, stdout: "", stderr: "" };
+      if (args[0] === "--help" || args[0] === "--version" || args[0] === "config") {
+        return { code: 0, stdout: "" };
+      }
+      calls.push([...args]);
+      if (args.includes("--large")) return { code: 0, stdout: "x".repeat(50_001) };
+      if (args[0] === "remove") {
+        await rm(options.cwd, { recursive: true, force: true });
+        return { code: 0, stdout: "removed\n" };
+      }
+      return { code: 0, stdout: "main worktree\n" };
+    },
+  }));
+  await handlers.get("session_start")({}, {
+    cwd: process.cwd(), signal: undefined, sessionManager: { getEntries: () => [] },
+  });
+
+  for (const mode of ["print", "json"]) {
+    const result = await tools.get("worktrunk").execute(
+      "call",
+      { command: "list" },
+      undefined,
+      undefined,
+      { cwd: process.cwd(), mode, hasUI: false, ui: {} },
+    );
+
+    assert.equal(result.terminate, undefined);
+    assert.equal(result.content[0].text, "main worktree");
+    assert.deepEqual(result.details, { args: ["list"], code: 0 });
+
+    await assert.rejects(
+      tools.get("worktrunk").execute(
+        `promote-${mode}`,
+        { command: "step", args: ["promote", "feature"] },
+        undefined,
+        undefined,
+        { cwd: process.cwd(), mode, hasUI: false, ui: {} },
+      ),
+      /requires TUI or RPC mode/,
+    );
+  }
+
+  await assert.rejects(
+    tools.get("worktrunk").execute(
+      "switch",
+      { command: "switch", args: ["feature"] },
+      undefined,
+      undefined,
+      { cwd: process.cwd(), mode: "print", hasUI: false, ui: {} },
+    ),
+    /requires TUI or RPC mode/,
+  );
+
+  const large = await tools.get("worktrunk").execute(
+    "large",
+    { command: "list", args: ["--large"] },
+    undefined,
+    undefined,
+    { cwd: process.cwd(), mode: "print", hasUI: false, ui: {} },
+  );
+  assert.ok(large.content[0].text.startsWith("x".repeat(50_000)));
+  assert.ok(large.content[0].text.endsWith("[output truncated]"));
+
+  const removedCwd = await mkdtemp(join(tmpdir(), "pi-worktrunk-print-"));
+  try {
+    const removed = await tools.get("worktrunk").execute(
+      "remove",
+      { command: "remove", args: ["current"] },
+      undefined,
+      undefined,
+      { cwd: removedCwd, mode: "print", hasUI: false, ui: {}, abort: () => { abortCalls += 1; } },
+    );
+    assert.equal(removed.terminate, true);
+    assert.match(removed.content[0].text, /working directory no longer exists/);
+    assert.equal(abortCalls, 1);
+  } finally {
+    await rm(removedCwd, { recursive: true, force: true });
+  }
+  assert.deepEqual(calls, [["list"], ["list"], ["list", "--large"], ["remove", "current"]]);
+  assert.deepEqual(sent, []);
+});
+
+test("removing the current worktree aborts the remaining tool batch", async () => {
+  const handlers = new Map<string, any>();
+  const commands = new Map<string, any>();
+  const tools = new Map<string, any>();
+  extension(baseApi({
+    handlers, commands, tools,
+    async exec(program, args, options) {
+      if (program === "git") return { code: 1, stdout: "", stderr: "" };
+      if (args[0] === "--help" || args[0] === "--version" || args[0] === "config") {
+        return { code: 0, stdout: "" };
+      }
+      if (args[0] === "remove") {
+        await rm(options.cwd, { recursive: true, force: true });
+        return { code: 0, stdout: "removed\n" };
+      }
+      return { code: 0, stdout: "" };
+    },
+  }));
+  await handlers.get("session_start")({}, {
+    cwd: process.cwd(), signal: undefined, sessionManager: { getEntries: () => [] },
+  });
+
+  const removedCwd = await mkdtemp(join(tmpdir(), "pi-worktrunk-batch-"));
+  try {
+    const registered = tools.get("worktrunk");
+    let remainingCalls = 0;
+    const faux = fauxProvider({ models: [{ id: "test" }] });
+    faux.setResponses([
+      fauxAssistantMessage([
+        fauxToolCall("worktrunk", { command: "remove", args: ["current"] }, { id: "remove" }),
+        fauxToolCall("remaining", { command: "list" }, { id: "remaining" }),
+      ], { stopReason: "toolUse" }),
+      fauxAssistantMessage("continued"),
+    ]);
+    const modelRuntime = await ModelRuntime.create({ modelsPath: null, refreshOnCreate: false });
+    modelRuntime.registerNativeProvider(faux.provider);
+    const remaining = {
+      name: "remaining",
+      description: "Runs after Worktrunk",
+      parameters: registered.parameters,
+      async execute() {
+        remainingCalls += 1;
+        return { content: [{ type: "text" as const, text: "ran" }], details: {} };
+      },
+    };
+    const { session } = await createAgentSession({
+      cwd: removedCwd,
+      agentDir: removedCwd,
+      model: faux.getModel(),
+      modelRuntime,
+      noTools: "builtin",
+      customTools: [registered, remaining],
+      sessionManager: SessionManager.inMemory(removedCwd),
+    });
+    try {
+      await session.prompt("remove the current worktree");
+
+      assert.equal(remainingCalls, 0);
+      assert.equal(faux.state.callCount, 1);
+    } finally {
+      session.dispose();
+    }
+  } finally {
+    await rm(removedCwd, { recursive: true, force: true });
+  }
 });
 
 test("Worktrunk client handles relocated lists and failures", async () => {
