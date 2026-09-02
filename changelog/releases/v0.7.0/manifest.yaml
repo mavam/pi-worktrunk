@@ -1,0 +1,9 @@
+created: 2026-09-02
+title: Reliable unattended Worktrunk commands
+intro: >-
+  Agents can now run Worktrunk commands without redundant Pi confirmations while Worktrunk
+  retains its own safeguards. Print and JSON sessions execute commands before exiting
+  and handle worktree removal safely.
+source:
+  mode: sync-stable-queue
+  previous_stable: v0.6.0
