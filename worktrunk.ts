@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, realpathSync, statSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { basename, dirname, resolve, sep } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 
 import {
   SessionManager,
@@ -459,17 +458,16 @@ function gitWorktreePaths(output: string): string[] {
 
 export default function extension(pi: ExtensionAPI) {
   const renderTransition: Parameters<ExtensionAPI["registerMessageRenderer"]>[1] =
-    (message, { expanded, outputPad }, theme) => {
+    (message, { outputPad }, theme) => {
     const details = message.details as Partial<SessionTransitionDetails> | undefined;
     const recovery = details?.kind === "recovery";
     const source = details?.source;
     const target = details?.target;
     const label = (location: SessionLocation) => location.branch ?? basename(location.path);
-    const compactPath = (path: string) => path === homedir() || path.startsWith(`${homedir()}${sep}`) ? `~${path.slice(homedir().length)}` : path;
-    let text = theme.fg("accent", theme.bold(`${recovery ? "↩ Session recovered" : "↪ Session moved"}`));
+    const title = recovery ? "↩ Session recovered" : "↪ Session moved";
+    let text = theme.fg("text", source?.path && target?.path ? `${title}:` : title);
     if (source?.path && target?.path) {
-      text += `\n  ${theme.fg("muted", label(source))} ${theme.fg("dim", "→")} ${theme.fg("accent", theme.bold(label(target)))}`;
-      if (expanded) text += `\n\n  ${theme.fg("dim", "From")}  ${compactPath(source.path)}\n  ${theme.fg("dim", "To")}    ${compactPath(target.path)}`;
+      text += ` ${theme.fg("accent", theme.bold(label(source)))} ${theme.fg("text", "→")} ${theme.fg("accent", theme.bold(label(target)))}`;
     }
     return new Text(text, outputPad, 0);
   };
@@ -587,7 +585,6 @@ export default function extension(pi: ExtensionAPI) {
     const destinationSession = createLinkedSession(ctx, source, target, trail, kind);
     const result = await ctx.switchSession(destinationSession, {
       withSession: async (nextCtx) => {
-        nextCtx.ui.notify(`Session ${kind === "recovery" ? "recovered" : "moved"} from ${source.branch ?? source.path} to ${target.branch ?? target.path}.`, "info");
         if (continuation) {
           await nextCtx.sendMessage(continuation, { triggerTurn: true });
         }
@@ -859,12 +856,18 @@ export default function extension(pi: ExtensionAPI) {
         if (invocation.length) text += ` ${theme.fg("accent", invocation.join(" "))}`;
         return new Text(text, 0, 0);
       },
-      renderResult(result) {
+      renderResult(result, _options, _theme, context) {
+        const details = result.details as { code?: unknown } | undefined;
+        if (!context.isError && details?.code === undefined) return new Text("", 0, 0);
         const text = result.content.find((item) => item.type === "text")?.text ?? "";
         return new Text(text, 0, 0);
       },
     });
   }
+
+  // Make renderers available before history is built, then refresh the command
+  // catalog after repository-specific discovery.
+  registerTool();
 
   pi.on("session_start", async (_event, ctx) => {
     await restoreRepositoryIdentity(ctx);

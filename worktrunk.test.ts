@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync, realpathSync } from "node:fs";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 
@@ -105,7 +105,7 @@ function baseApi(options: {
   } as any;
 }
 
-test("session start registers one repository-specific tool", async () => {
+test("tool registers synchronously before repository-specific discovery", async () => {
   const handlers = new Map<string, any>();
   const commands = new Map<string, any>();
   const tools = new Map<string, any>();
@@ -128,9 +128,10 @@ test("session start registers one repository-specific tool", async () => {
       return { code: 0, stdout: "" };
     },
   }));
-  await handlers.get("session_start")({}, { cwd: process.cwd(), signal: undefined, sessionManager: { getEntries: () => [] } });
   assert.deepEqual([...commands.keys()], ["wt"]);
   assert.deepEqual([...tools.keys()], ["worktrunk"]);
+
+  await handlers.get("session_start")({}, { cwd: process.cwd(), signal: undefined, sessionManager: { getEntries: () => [] } });
   const tool = tools.get("worktrunk");
   assert.deepEqual(tool.parameters.required, ["command"]);
   assert.deepEqual(tool.parameters.properties.command.enum, [
@@ -174,10 +175,12 @@ test("tool queues aliases without confirmation", async () => {
     },
   }));
   await handlers.get("session_start")({}, { cwd: process.cwd(), signal: undefined, sessionManager: { getEntries: () => [] } });
-  const result = await tools.get("worktrunk").execute("call", { command: "land", args: ["-v", "two words"] }, undefined, undefined, {
+  const tool = tools.get("worktrunk");
+  const result = await tool.execute("call", { command: "land", args: ["-v", "two words"] }, undefined, undefined, {
     cwd: process.cwd(), hasUI: false, ui: {},
   });
   assert.equal(result.terminate, true);
+  assert.deepEqual(tool.renderResult(result, {}, {}, { isError: false }).render(100), []);
   assert.match(sent[0].text, /^\/wt 'land' '-v' 'two words' '__pi_worktrunk_continuation=[^']+'$/);
   assert.deepEqual(sent[0].options, {
     deliverAs: "followUp",
@@ -599,7 +602,7 @@ test("a failed command that removes the cwd recovers and resumes with the failur
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("transition renderer keeps move and recovery variants", () => {
+test("transition renderer keeps move and recovery variants compact", () => {
   const handlers = new Map<string, any>();
   const commands = new Map<string, any>();
   const tools = new Map<string, any>();
@@ -607,18 +610,19 @@ test("transition renderer keeps move and recovery variants", () => {
   extension(baseApi({ handlers, commands, tools, renderer: renderers, async exec() { return { code: 0, stdout: "" }; } }));
   const renderer = renderers.get("pi-worktrunk");
   assert.ok(renderers.has("pi-worktrunk-session-transition"));
-  const theme = { fg(_color: string, text: string) { return text; }, bold(text: string) { return text; } };
+  const theme = {
+    fg(color: string, text: string) { return `<${color}>${text}</${color}>`; },
+    bold(text: string) { return `<bold>${text}</bold>`; },
+  };
   const message = { details: {
     kind: "move",
-    source: { branch: "feature/wt-session-placement", path: `${homedir()}/code/pi-worktrunk.feature` },
-    target: { branch: "main", path: `${homedir()}/code/pi-worktrunk` },
+    source: { branch: "testing", path: "/code/testing" },
+    target: { branch: "main", path: "/code/main" },
   } };
-  assert.deepEqual(renderer(message, { expanded: false, outputPad: 0 }, theme).render(100).map((line: string) => line.trimEnd()), [
-    "↪ Session moved", "  feature/wt-session-placement → main",
-  ]);
-  assert.deepEqual(renderer(message, { expanded: true, outputPad: 0 }, theme).render(100).map((line: string) => line.trimEnd()), [
-    "↪ Session moved", "  feature/wt-session-placement → main", "", "  From  ~/code/pi-worktrunk.feature", "  To    ~/code/pi-worktrunk",
-  ]);
+  assert.equal(
+    renderer(message, { expanded: false, outputPad: 0 }, theme).render(200)[0].trimEnd(),
+    "<text>↪ Session moved:</text> <accent><bold>testing</bold></accent> <text>→</text> <accent><bold>main</bold></accent>",
+  );
   message.details.kind = "recovery";
-  assert.equal(renderer(message, { expanded: false, outputPad: 0 }, theme).render(100)[0].trimEnd(), "↩ Session recovered");
+  assert.match(renderer(message, { outputPad: 0 }, theme).render(200)[0], /↩ Session recovered:/);
 });
