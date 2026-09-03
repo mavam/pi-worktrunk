@@ -5,7 +5,6 @@
   "type": "module",
   "files": [
     "worktrunk.ts",
-    "worktrunk-reference.ts",
     "README.md",
     "LICENSE"
   ],
@@ -36,10 +35,8 @@
     "typebox": "*"
   },
   "scripts": {
-    "check": "tsc --noEmit && node --test --experimental-strip-types *.test.ts scripts/*.test.ts && bun run check-reference",
-    "check-reference": "node --experimental-strip-types scripts/generate-worktrunk-reference.ts --check",
-    "generate-reference": "node --experimental-strip-types scripts/generate-worktrunk-reference.ts",
-    "test": "node --test --experimental-strip-types *.test.ts scripts/*.test.ts"
+    "check": "tsc --noEmit && node --test --experimental-strip-types *.test.ts",
+    "test": "node --test --experimental-strip-types *.test.ts"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
