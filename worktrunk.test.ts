@@ -8,18 +8,55 @@ import test from "node:test";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
 import { createAgentSession, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 
-import { WORKTRUNK_REFERENCE_VERSION } from "./worktrunk-reference.ts";
 import extension, {
   MARKERS,
+  buildReference,
   createMarkerUpdater,
   createWorktrunkClient,
+  formatReference,
   markerArgs,
   parseAliasArguments,
+  parseCommand,
   parseWtInvocation,
-  parseWorktrunkAliasMetadata,
-  parseWorktrunkAliasNames,
+  parseWorktrunkAliases,
   parseWorktrunkCommands,
+  renderToolExample,
+  splitShell,
 } from "./worktrunk.ts";
+
+const switchHelpMarkdown = `wt switch - Switch to a worktree; create if needed
+
+Usage: wt switch [OPTIONS] [BRANCH]
+
+Arguments:
+  [BRANCH]
+          Branch, path, or shortcut
+
+          Shortcuts include ^, -, @, pr:{N}, and mr:{N}.
+
+Options:
+  -c, --create
+          Create a new branch
+
+  -b, --base <BASE>
+          Base branch
+
+          Defaults to the default branch and accepts the same shortcuts as BRANCH.
+
+  -x, --execute <EXECUTE>
+          Program to run after switch. Shell syntax requires an explicit shell, for example
+          -x sh -- -c 'npm install && npm test'.
+
+  -h, --help
+          Print help
+
+## Examples
+
+\`\`\`console
+$ wt switch --create new-feature  # Create branch and worktree
+$ wt -v switch pr:123
+\`\`\`
+`;
 
 const list = (items: unknown[]) => JSON.stringify({ schema: 2, items });
 const wtList = (source: string, target?: string) => list([
@@ -52,27 +89,116 @@ test("argument parsing preserves Worktrunk argv", () => {
   assert.throws(() => parseAliasArguments("'unfinished"), /unterminated quote/);
 });
 
-test("command and alias discovery parse Worktrunk help", () => {
+test("command and alias discovery parse Markdown help and settings", () => {
   const help = [
     "Commands:",
     "  switch  Switch worktrees",
     "  doctor  Diagnose setup",
-    "",
-    "Aliases:",
-    "  land, deploy",
   ].join("\n");
   assert.deepEqual(parseWorktrunkCommands(help), [
     { name: "switch", description: "Switch worktrees" },
     { name: "doctor", description: "Diagnose setup" },
   ]);
-  assert.deepEqual(parseWorktrunkAliasNames(help), ["land", "deploy"]);
-  assert.deepEqual(parseWorktrunkAliasMetadata(["land", "deploy"], JSON.stringify({
+  assert.deepEqual(parseWorktrunkAliases(JSON.stringify({
     user: { config: { aliases: { land: [{ "merge-pr": "gh pr merge" }, { verify: "bun test" }] } } },
     project: { config: { aliases: { land: [{ cleanup: "wt remove" }], deploy: "make deploy" } } },
   })), [
     { name: "land", steps: ["merge-pr", "verify", "cleanup"] },
     { name: "deploy", steps: [] },
   ]);
+});
+
+test("Markdown help parsing preserves complete arguments, options, and examples", () => {
+  const parsed = parseCommand(["switch"], switchHelpMarkdown);
+  assert.deepEqual(parsed.arguments, [{
+    syntax: "[BRANCH]",
+    description: "Branch, path, or shortcut Shortcuts include ^, -, @, pr:{N}, and mr:{N}.",
+  }]);
+  assert.deepEqual(parsed.options, [
+    { syntax: "-c, --create", description: "Create a new branch" },
+    {
+      syntax: "-b, --base <BASE>",
+      description: "Base branch Defaults to the default branch and accepts the same shortcuts as BRANCH.",
+    },
+    {
+      syntax: "-x, --execute <EXECUTE>",
+      description: "Program to run after switch. Shell syntax requires an explicit shell, for example -x sh -- -c 'npm install && npm test'.",
+    },
+  ]);
+  assert.deepEqual(parsed.examples, [
+    ["switch", "--create", "new-feature"],
+    ["-v", "switch", "pr:123"],
+  ]);
+});
+
+test("shell examples become tool calls", () => {
+  assert.deepEqual(splitShell(`switch --create "two words" # comment`), [
+    "switch", "--create", "two words",
+  ]);
+  assert.equal(splitShell("switch main | cat"), undefined);
+  assert.equal(
+    renderToolExample(["-v", "switch", "pr:123"], new Set(["switch"])),
+    '{"command":"switch","args":["-v","pr:123"]}',
+  );
+});
+
+test("subcommands preserve wrapped summaries and parent fallbacks", () => {
+  const parsed = parseCommand(["step"], [
+    "wt step - Run individual operations",
+    "",
+    "Commands:",
+    "  tether  Run a command; kill its whole process tree when its worktree is",
+    "          removed",
+  ].join("\n"));
+  assert.equal(parsed.subcommands[0].description,
+    "Run a command; kill its whole process tree when its worktree is removed");
+  const fallback = parseCommand(["hook", "pre-switch"], "wt hook pre-switch\n", "Run pre-switch hooks");
+  assert.equal(fallback.summary, "Run pre-switch hooks");
+});
+
+test("reference generation recursively discovers every Markdown help command", async () => {
+  const rootOutput = "wt - Worktree manager\n\nCommands:\n  config  Manage configuration\n";
+  const outputs = new Map([
+    ["config", "wt config - Manage configuration\n\nCommands:\n  plugins  Plugin management\n"],
+    ["config plugins", [
+      "wt config plugins - Plugin management",
+      "",
+      "Commands:",
+      "  claude  Claude Code plugin",
+      "",
+      "## Examples",
+      "```console",
+      "$ wt config plugins claude install",
+      "```",
+    ].join("\n")],
+    ["config plugins claude", "wt config plugins claude - Claude Code plugin\n\nCommands:\n  install  Install the plugin\n"],
+    ["config plugins claude install", "wt config plugins claude install - Install the plugin\n\nUsage: wt config plugins claude install\n"],
+  ]);
+  const calls: string[] = [];
+  const reference = await buildReference(
+    parseWorktrunkCommands(rootOutput),
+    rootOutput,
+    async (path) => { calls.push(path.join(" ")); return outputs.get(path.join(" ")); },
+  );
+  assert.deepEqual(calls, [...outputs.keys()]);
+  assert.match(reference, /config plugins claude install — Install the plugin/);
+  assert.match(reference, /\{"command":"config","args":\["plugins","claude","install"\]\}/);
+});
+
+test("reference generation stays within the size cap", () => {
+  const rootOutput = "Commands:\n  switch  Switch worktrees\n";
+  const root = parseCommand([], rootOutput);
+  const command = parseCommand(["switch"], "", "Switch worktrees");
+  command.options = [{
+    syntax: "--verbose-help",
+    description: `Short description. ${"Long option details ".repeat(2_000)}`,
+  }];
+  command.examples = [["switch", "main"]];
+  const reference = formatReference(root, [command], rootOutput);
+  assert.ok(Buffer.byteLength(reference) <= 30_000);
+  assert.match(reference, /Short description\./);
+  assert.doesNotMatch(reference, /Long option details/);
+  assert.match(reference, /\{"command":"switch","args":\["main"\]\}/);
 });
 
 test("markers map Pi state to Worktrunk", async () => {
@@ -113,15 +239,13 @@ test("tool registers synchronously before repository-specific discovery", async 
     handlers, commands, tools,
     async exec(program, args) {
       if (program === "git") return { code: 1, stdout: "", stderr: "" };
-      if (args.join(" ") === "--help") return { code: 0, stdout: [
+      if (args.join(" ") === "--help-md") return { code: 0, stdout: [
         "Commands:",
         "  switch  Switch worktrees",
         "  doctor  Diagnose setup",
-        "",
-        "Aliases:",
-        "  land, deploy",
       ].join("\n") };
       if (args.join(" ") === "--version") return { code: 0, stdout: "wt v-next\n" };
+      if (args.join(" ") === "switch --help-md") return { code: 0, stdout: switchHelpMarkdown };
       if (args.join(" ") === "config show --format=json") return { code: 0, stdout: JSON.stringify({
         project: { config: { aliases: { land: [{ "merge-pr": "x" }, { verify: "x" }, { cleanup: "x" }], deploy: "x" } } },
       }) };
@@ -130,24 +254,24 @@ test("tool registers synchronously before repository-specific discovery", async 
   }));
   assert.deepEqual([...commands.keys()], ["wt"]);
   assert.deepEqual([...tools.keys()], ["worktrunk"]);
+  assert.equal(tools.get("worktrunk").parameters.properties.command.type, "string");
+  assert.equal(tools.get("worktrunk").parameters.properties.command.enum, undefined);
 
   await handlers.get("session_start")({}, { cwd: process.cwd(), signal: undefined, sessionManager: { getEntries: () => [] } });
   const tool = tools.get("worktrunk");
   assert.deepEqual(tool.parameters.required, ["command"]);
   assert.deepEqual(tool.parameters.properties.command.enum, [
-    "switch", "list", "remove", "merge", "step", "hook", "config", "doctor", "land", "deploy",
+    "switch", "doctor", "land", "deploy",
   ]);
   assert.match(tool.parameters.properties.args.description, /Arguments after the Worktrunk command/);
   assert.match(tool.description, /Worktrunk command reference/);
   assert.match(tool.description, /switch — Switch to a worktree; create if needed/);
   assert.match(tool.description, /- -c, --create: Create a new branch/);
   assert.match(tool.description, /\{"command":"switch","args":\["--create","new-feature"\]\}/);
-  assert.match(tool.description, /config state marker — Branch markers/);
-  assert.ok(tool.description.includes(`Bundled reference: ${WORKTRUNK_REFERENCE_VERSION}; installed: wt v-next`));
-  assert.match(tool.description, /doctor: Diagnose setup/);
+  assert.match(tool.description, /Reference generated from installed wt v-next/);
   assert.match(tool.description, /land: merge-pr -> verify -> cleanup/);
   assert.match(tool.description, /Example: \{"command":"deploy","args":\[\]\}/);
-  assert.match(tool.promptSnippet, /complete built-in command, option, and example reference/);
+  assert.match(tool.promptSnippet, /installed command, option, and example reference/);
   assert.ok(tool.promptGuidelines.some((guideline: string) => guideline.includes("reference and examples")));
   assert.deepEqual(tool.prepareArguments({ args: ["switch", "--create", "fix/parser"] }), {
     command: "switch", args: ["--create", "fix/parser"],
@@ -160,6 +284,26 @@ test("tool registers synchronously before repository-specific discovery", async 
   ]);
 });
 
+test("missing Worktrunk keeps the generic startup tool", async () => {
+  const handlers = new Map<string, any>();
+  const commands = new Map<string, any>();
+  const tools = new Map<string, any>();
+  extension(baseApi({
+    handlers, commands, tools,
+    async exec(program) {
+      if (program === "git") return { code: 1, stdout: "", stderr: "" };
+      throw new Error("spawn wt ENOENT");
+    },
+  }));
+  await assert.doesNotReject(handlers.get("session_start")({}, {
+    cwd: process.cwd(), signal: undefined, sessionManager: { getEntries: () => [] },
+  }));
+  const tool = tools.get("worktrunk");
+  assert.equal(tool.parameters.properties.command.type, "string");
+  assert.equal(tool.parameters.properties.command.enum, undefined);
+  assert.doesNotMatch(tool.description, /Worktrunk command reference/);
+});
+
 test("tool queues aliases without confirmation", async () => {
   const handlers = new Map<string, any>();
   const commands = new Map<string, any>();
@@ -169,7 +313,7 @@ test("tool queues aliases without confirmation", async () => {
     handlers, commands, tools, sent,
     async exec(program, args) {
       if (program === "git") return { code: 1, stdout: "", stderr: "" };
-      if (args[0] === "--help") return { code: 0, stdout: "Aliases:\n  land\n" };
+      if (args[0] === "--help-md") return { code: 0, stdout: "wt - Worktree manager\n" };
       if (args[0] === "config") return { code: 0, stdout: JSON.stringify({ project: { config: { aliases: { land: [{ verify: "x" }] } } } }) };
       return { code: 0, stdout: "" };
     },
@@ -205,7 +349,7 @@ test("non-interactive tools run Worktrunk before the session exits", async () =>
     handlers, commands, tools, sent,
     async exec(program, args, options) {
       if (program === "git") return { code: 1, stdout: "", stderr: "" };
-      if (args[0] === "--help" || args[0] === "--version" || args[0] === "config") {
+      if (args[0] === "--help-md" || args[0] === "--version" || args[0] === "config") {
         return { code: 0, stdout: "" };
       }
       calls.push([...args]);
@@ -294,7 +438,7 @@ test("removing the current worktree aborts the remaining tool batch", async () =
     handlers, commands, tools,
     async exec(program, args, options) {
       if (program === "git") return { code: 1, stdout: "", stderr: "" };
-      if (args[0] === "--help" || args[0] === "--version" || args[0] === "config") {
+      if (args[0] === "--help-md" || args[0] === "--version" || args[0] === "config") {
         return { code: 0, stdout: "" };
       }
       if (args[0] === "remove") {
@@ -393,7 +537,7 @@ test("create-and-switch moves and resumes model work", async () => {
       handlers, commands, tools, sent,
       async exec(program, args) {
         if (program === "git") return { code: 0, stdout: `${common}\n`, stderr: "" };
-        if (args[0] === "--help") return { code: 0, stdout: "" };
+        if (args[0] === "--help-md") return { code: 0, stdout: "" };
         if (args.includes("list")) return { code: 0, stdout: wtList(source, created ? target : undefined) };
         wtCalls.push([...args]);
         if (args.join("\0") === ["switch", "--create", "fix/parser"].join("\0")) {
@@ -446,7 +590,7 @@ test("model list bypasses the picker and receives Worktrunk output", async () =>
   try {
     extension(baseApi({ handlers, commands, tools, messages, sent, async exec(program, args) {
       if (program === "git") return { code: 0, stdout: `${join(source, ".git")}\n` };
-      if (args[0] === "--help") return { code: 0, stdout: "" };
+      if (args[0] === "--help-md") return { code: 0, stdout: "" };
       if (args.length === 1 && args[0] === "list") return { code: 0, stdout: "main worktree" };
       if (args.includes("list")) return { code: 0, stdout: wtList(source) };
       return { code: 0, stdout: "" };
@@ -485,7 +629,7 @@ test("JSON mode runs exact argv without replacing the session", async () => {
   try {
     extension(baseApi({ handlers, commands, tools, messages, async exec(program, args) {
       if (program === "git") return { code: 0, stdout: `${join(source, ".git")}\n` };
-      if (args[0] === "--help") return { code: 0, stdout: "" };
+      if (args[0] === "--help-md") return { code: 0, stdout: "" };
       if (args.includes("list")) return { code: 0, stdout: list([
         { branch: "feature", worktree: { path: source, current: true } },
         { branch: "main", worktree: { path: target, main: true } },
@@ -501,7 +645,11 @@ test("JSON mode runs exact argv without replacing the session", async () => {
       async waitForIdle() {}, async switchSession() { switches += 1; return { cancelled: false }; },
       ui: { notify() {} },
     });
-    assert.deepEqual(calls.filter((args) => args[0] !== "config" && args[0] !== "--version"), [["-v", "switch", "main"]]);
+    assert.deepEqual(
+      calls.filter((args) =>
+        args[0] !== "config" && args[0] !== "--version" && !args.includes("--help-md")),
+      [["-v", "switch", "main"]],
+    );
     assert.equal(switches, 0);
     assert.equal(messages.at(-1)?.message.content, "switched");
   } finally { await rm(root, { recursive: true, force: true }); }
@@ -519,7 +667,7 @@ test("ambiguous creations stay in the source session", async () => {
   try {
     extension(baseApi({ handlers, commands, tools, async exec(program, args) {
       if (program === "git") return { code: 0, stdout: `${join(source, ".git")}\n` };
-      if (args[0] === "--help") return { code: 0, stdout: "" };
+      if (args[0] === "--help-md") return { code: 0, stdout: "" };
       if (args.includes("list")) return { code: 0, stdout: list([
         { branch: "main", worktree: { path: source, main: true, current: true } },
         ...(changed ? [
@@ -565,8 +713,10 @@ test("a failed command that removes the cwd recovers and resumes with the failur
         return { code: 0, stdout: `worktree ${main}\0HEAD aaaa\0branch refs/heads/main\0\0` };
       }
       if (program === "git") return { code: 0, stdout: `${common}\n` };
-      if (args[0] === "--help") return { code: 0, stdout: "Aliases:\n  land\n" };
-      if (args[0] === "config" && args[1] === "show") return { code: 0, stdout: "{}" };
+      if (args[0] === "--help-md") return { code: 0, stdout: "wt - Worktree manager\n" };
+      if (args[0] === "config" && args[1] === "show") {
+        return { code: 0, stdout: JSON.stringify({ user: { config: { aliases: { land: [{ cleanup: "x" }] } } } }) };
+      }
       if (args.includes("list")) return { code: 0, stdout: list([
         { branch: "main", worktree: { path: main, main: true, current: !existsSync(source) } },
         ...(existsSync(source) ? [{ branch: "feature", worktree: { path: source, current: true } }] : []),

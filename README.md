@@ -69,12 +69,13 @@ remaining arguments directly to `wt` without shell expansion:
 { "command": "switch", "args": ["--create", "fix/parser"] }
 ```
 
-The tool description includes the generated built-in command tree, meaningful
-options, arguments, and canonical examples. Commands added by a newer installed
-Worktrunk version and repository aliases are discovered at startup. Agent calls
-run without an additional Pi confirmation. Commands that move to another
-worktree stop the old model turn, switch to a linked session, report Worktrunk's
-result, and resume the task there.
+At startup, the extension generates the tool reference from the installed
+Worktrunk binary. The description therefore matches its command tree, options,
+arguments, and examples without requiring a matching pi-worktrunk release.
+Repository aliases are discovered at the same time. Agent calls run without an
+additional Pi confirmation. Commands that move to another worktree stop the old
+model turn, switch to a linked session, report Worktrunk's result, and resume the
+task there.
 
 ## 🧰 Requirements
 

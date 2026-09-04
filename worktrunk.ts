@@ -14,12 +14,6 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-import {
-  WORKTRUNK_COMMANDS,
-  WORKTRUNK_REFERENCE,
-  WORKTRUNK_REFERENCE_VERSION,
-} from "./worktrunk-reference.ts";
-
 export const MARKERS = { working: "🤖", waiting: "💬" } as const;
 
 type WtResult = {
@@ -32,6 +26,7 @@ type WtResult = {
 type RunWtOptions = {
   cwd?: string;
   signal?: AbortSignal;
+  timeout?: number;
   cwdMode?: "repository-read";
 };
 type RunWt = (args: string[], options?: RunWtOptions) => Promise<WtResult>;
@@ -54,6 +49,16 @@ type WorktreeItem = {
 type WorktreeList = { schema: number; items: WorktreeItem[] };
 export type WorktrunkAlias = { name: string; steps: string[] };
 export type WorktrunkCommand = { name: string; description: string };
+export type ReferenceEntry = { syntax: string; description: string };
+export type CommandReference = {
+  path: string[];
+  summary: string;
+  usage: string;
+  arguments: ReferenceEntry[];
+  options: ReferenceEntry[];
+  subcommands: ReferenceEntry[];
+  examples: string[][];
+};
 type SessionLocation = { branch: string | null; path: string; commonDir?: string };
 type SessionTransitionKind = "move" | "recovery";
 type SessionTransitionDetails = {
@@ -86,6 +91,11 @@ const MAX_CONTINUATION_OUTPUT = 50_000;
 const CONTINUATION_ARG_PREFIX = "__pi_worktrunk_continuation=";
 const REPOSITORY_IDENTITY_ENTRY = "pi-worktrunk-repository";
 const WORKTRUNK_ALIAS_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+const MAX_REFERENCE_BYTES = 30_000;
+const MAX_EXAMPLES_PER_COMMAND = 3;
+const HELP_DESCRIPTION_INDENT = 10;
+const HELP_PROBE_CONCURRENCY = 8;
+const HELP_PROBE_TIMEOUT_MS = 10_000;
 
 class WorktrunkError extends Error {
   constructor(message: string) {
@@ -230,33 +240,335 @@ export function createWorktrunkClient(runWt: RunWt) {
   };
 }
 
-export function parseWorktrunkCommands(output: string): WorktrunkCommand[] {
-  const commands: WorktrunkCommand[] = [];
-  let inCommands = false;
-  for (const line of output.split("\n")) {
-    if (!inCommands) { if (line.trim() === "Commands:") inCommands = true; continue; }
-    if (!line.trim() || !/^\s/.test(line)) break;
-    const match = line.match(/^\s+([A-Za-z0-9][A-Za-z0-9_-]*)\s{2,}(.+?)\s*$/);
-    if (match && !commands.some(({ name }) => name === match[1])) {
-      commands.push({ name: match[1], description: match[2] });
-    }
-  }
-  return commands;
+function isEntryStart(value: string, kind: "argument" | "option"): boolean {
+  return kind === "option"
+    ? /^--?[A-Za-z0-9]/.test(value)
+    : /^(?:\[(?!(?:default|possible values):)[^\]]+\]|<[^>]+>)(?:\.{3})?/.test(value);
 }
 
-export function parseWorktrunkAliasNames(output: string): string[] {
-  const aliases: string[] = [];
-  let inAliases = false;
+function indentation(line: string): number {
+  return line.length - line.trimStart().length;
+}
+
+export function parseSectionEntries(
+  output: string,
+  sectionNames: ReadonlySet<string>,
+  kind: "argument" | "option",
+): ReferenceEntry[] {
+  const lines = output.split("\n");
+  const entries: ReferenceEntry[] = [];
+  let active = false;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const heading = line.match(/^([A-Za-z][A-Za-z ]+):$/)?.[1];
+    if (heading) {
+      active = sectionNames.has(heading) || (
+        heading !== "Global Options" &&
+        sectionNames.has("* Options") &&
+        heading.endsWith(" Options")
+      );
+      continue;
+    }
+    if (!active) continue;
+    if (!line.trim()) continue;
+    if (!/^\s/.test(line)) { active = false; continue; }
+    const trimmed = line.trim();
+    if (indentation(line) >= HELP_DESCRIPTION_INDENT || !isEntryStart(trimmed, kind)) continue;
+    const match = trimmed.match(/^(.+?)(?:\s{2,}(.+))?$/);
+    if (!match) continue;
+    if (kind === "option" && /(?:^|, )-(?:h|-help|V|-version)(?:\s|$)/.test(match[1])) continue;
+
+    const details = match[2] ? [match[2]] : [];
+    for (let next = index + 1; next < lines.length; next += 1) {
+      const candidate = lines[next];
+      if (!candidate.trim()) continue;
+      if (!/^\s/.test(candidate)) break;
+      const detail = candidate.trim();
+      if (indentation(candidate) < HELP_DESCRIPTION_INDENT && isEntryStart(detail, kind)) break;
+      if (!/^[─┌└├┬┼│]/.test(detail)) details.push(detail);
+    }
+    entries.push({ syntax: match[1], description: details.join(" ") });
+  }
+  return entries;
+}
+
+export function parseCommands(output: string): ReferenceEntry[] {
+  const entries: ReferenceEntry[] = [];
+  let active = false;
   for (const line of output.split("\n")) {
-    if (!inAliases) { if (line.trim() === "Aliases:") inAliases = true; continue; }
+    if (!active) { if (line.trim() === "Commands:") active = true; continue; }
     if (!line.trim() || !/^\s/.test(line)) break;
-    for (const value of line.split(",")) {
-      const name = value.trim();
-      if (WORKTRUNK_ALIAS_NAME.test(name) && !aliases.includes(name)) aliases.push(name);
+    const match = line.match(/^\s+([A-Za-z0-9][A-Za-z0-9_-]*)\s{2,}(.+?)\s*$/);
+    if (match) {
+      entries.push({ syntax: match[1], description: match[2] });
+    } else if (entries.length) {
+      entries.at(-1)!.description += ` ${line.trim()}`;
     }
   }
-  return aliases;
+  return entries;
 }
+
+export function splitShell(input: string): string[] | undefined {
+  const result: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | undefined;
+  let escaping = false;
+  for (let index = 0; index < input.length; index += 1) {
+    const character = input[index];
+    if (escaping) { current += character; escaping = false; continue; }
+    if (character === "\\" && quote !== "'") { escaping = true; continue; }
+    if (quote) {
+      if (character === quote) quote = undefined;
+      else current += character;
+      continue;
+    }
+    if (character === "'" || character === '"') { quote = character; continue; }
+    if (character === "#" && (index === 0 || /\s/.test(input[index - 1]))) break;
+    if (/\s/.test(character)) {
+      if (current) { result.push(current); current = ""; }
+      continue;
+    }
+    if ("|;&><`".includes(character)) return undefined;
+    current += character;
+  }
+  if (quote || escaping) return undefined;
+  if (current) result.push(current);
+  return result;
+}
+
+export function parseCommand(
+  path: string[],
+  output: string,
+  fallbackSummary = "",
+): CommandReference {
+  const firstLine = output.split("\n")[0] ?? "";
+  const summary = (
+    firstLine.match(/^wt(?:\s+.*?)?\s+-\s+(.+)$/)?.[1]
+    ?? (/^wt(?:\s|$)/.test(firstLine) ? "" : firstLine.trim())
+  ) || fallbackSummary;
+  const usage = output.split("\n").find((line) => line.startsWith("Usage: "))?.slice(7)
+    ?? `wt ${path.join(" ")}`.trimEnd();
+  return {
+    path,
+    summary,
+    usage,
+    arguments: parseSectionEntries(output, new Set(["Arguments"]), "argument"),
+    options: parseSectionEntries(output, new Set(["Options", "* Options", "Automation", "Output"]), "option"),
+    subcommands: parseCommands(output),
+    examples: parseExamples(output),
+  };
+}
+
+function fencedBlocks(output: string): string[] {
+  const lines = output.split("\n");
+  const blocks: string[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const opening = lines[index].match(/^(`{3,}|~{3,})[^`~]*$/);
+    if (!opening) continue;
+    const delimiter = opening[1];
+    const body: string[] = [];
+    for (index += 1; index < lines.length; index += 1) {
+      if (lines[index].trim() === delimiter) break;
+      body.push(lines[index]);
+    }
+    blocks.push(body.join("\n"));
+  }
+  return blocks;
+}
+
+export function parseExamples(output: string): string[][] {
+  const examples: string[][] = [];
+  for (const block of fencedBlocks(output)) {
+    for (const line of block.split("\n")) {
+      const match = line.match(/^\s*\$\s+wt(?:\s+(.+?))?\s*$/);
+      if (!match?.[1]) continue;
+      const tokens = splitShell(match[1]);
+      if (!tokens?.length) continue;
+      const key = JSON.stringify(tokens);
+      if (!examples.some((example) => JSON.stringify(example) === key)) examples.push(tokens);
+    }
+  }
+  return examples;
+}
+
+function attributeExamples(commands: CommandReference[]): void {
+  const examples = commands.flatMap((command) => command.examples);
+  for (const command of commands) command.examples = [];
+  const candidates = [...commands].sort((left, right) => right.path.length - left.path.length);
+  for (const tokens of examples) {
+    const command = candidates.find(({ path }) => tokens.some((_, start) =>
+      path.every((part, index) => tokens[start + index] === part)));
+    if (!command) continue;
+    const key = JSON.stringify(tokens);
+    if (!command.examples.some((example) => JSON.stringify(example) === key)) {
+      command.examples.push(tokens);
+    }
+  }
+}
+
+export function renderToolExample(
+  tokens: readonly string[],
+  topLevelCommands: ReadonlySet<string>,
+): string | undefined {
+  const commandIndex = tokens.findIndex((token) => topLevelCommands.has(token));
+  if (commandIndex < 0) return undefined;
+  return JSON.stringify({
+    command: tokens[commandIndex],
+    args: [...tokens.slice(0, commandIndex), ...tokens.slice(commandIndex + 1)],
+  });
+}
+
+function firstSentence(description: string): string {
+  return description.match(/^.*?[.!?](?=\s+[A-Z]|\s*$)/)?.[0] ?? description;
+}
+
+function truncateReference(reference: string): string {
+  const suffix = "\n[reference truncated]";
+  const limit = MAX_REFERENCE_BYTES - Buffer.byteLength(suffix);
+  const codePoints = [...reference];
+  let low = 0;
+  let high = codePoints.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (Buffer.byteLength(codePoints.slice(0, middle).join("")) <= limit) low = middle;
+    else high = middle - 1;
+  }
+  let result = codePoints.slice(0, low).join("");
+  const newline = result.lastIndexOf("\n");
+  if (newline > 0) result = result.slice(0, newline);
+  return `${result}${suffix}`;
+}
+
+function renderReference(
+  root: CommandReference,
+  all: readonly CommandReference[],
+  rootOutput: string,
+  trimOptions: boolean,
+  includeExamples: boolean,
+): string {
+  const lines = ["Worktrunk command reference"];
+  const topLevelCommands = new Set(root.subcommands.map(({ syntax }) => syntax));
+  const globalOptions = parseSectionEntries(rootOutput, new Set(["Options", "Global Options"]), "option");
+  if (globalOptions.length) {
+    lines.push("", "Global options:");
+    for (const option of globalOptions) {
+      lines.push(`- ${option.syntax}: ${trimOptions ? firstSentence(option.description) : option.description}`);
+    }
+  }
+  for (const command of all) {
+    lines.push("", `${command.path.join(" ")} — ${command.summary}`);
+    if (command.path.length === 1) lines.push(`Usage: ${command.usage}`);
+    if (command.subcommands.length) {
+      lines.push("Subcommands:");
+      for (const subcommand of command.subcommands) lines.push(`- ${subcommand.syntax}: ${subcommand.description}`);
+    }
+    if (command.arguments.length) {
+      lines.push("Arguments:");
+      for (const argument of command.arguments) lines.push(`- ${argument.syntax}: ${argument.description}`);
+    }
+    if (command.options.length) {
+      lines.push("Options:");
+      for (const option of command.options) {
+        lines.push(`- ${option.syntax}: ${trimOptions ? firstSentence(option.description) : option.description}`);
+      }
+    }
+    if (!includeExamples) continue;
+    const examples = command.examples.flatMap((tokens) => {
+      const example = renderToolExample(tokens, topLevelCommands);
+      return example ? [example] : [];
+    }).slice(0, MAX_EXAMPLES_PER_COMMAND);
+    if (examples.length) {
+      lines.push("Examples:");
+      for (const example of examples) lines.push(`- ${example}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+export function formatReference(
+  root: CommandReference,
+  all: readonly CommandReference[],
+  rootOutput: string,
+): string {
+  let reference = renderReference(root, all, rootOutput, false, true);
+  if (Buffer.byteLength(reference) <= MAX_REFERENCE_BYTES) return reference;
+  reference = renderReference(root, all, rootOutput, true, true);
+  if (Buffer.byteLength(reference) <= MAX_REFERENCE_BYTES) return reference;
+  reference = renderReference(root, all, rootOutput, true, false);
+  return Buffer.byteLength(reference) <= MAX_REFERENCE_BYTES
+    ? reference
+    : truncateReference(reference);
+}
+
+async function mapConcurrent<T, R>(
+  items: readonly T[],
+  worker: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  await Promise.all(Array.from(
+    { length: Math.min(HELP_PROBE_CONCURRENCY, items.length) },
+    async () => {
+      while (next < items.length) {
+        const index = next;
+        next += 1;
+        results[index] = await worker(items[index]);
+      }
+    },
+  ));
+  return results;
+}
+
+export async function buildReference(
+  commands: readonly WorktrunkCommand[],
+  rootOutput: string,
+  readCommand: (path: readonly string[]) => Promise<string | undefined>,
+): Promise<string> {
+  type PendingCommand = { path: string[]; summary: string };
+  const references = new Map<string, CommandReference>();
+  const requested = new Set<string>();
+  let pending: PendingCommand[] = commands.map(({ name, description }) => ({
+    path: [name],
+    summary: description,
+  }));
+
+  while (pending.length) {
+    for (const { path } of pending) requested.add(path.join("\0"));
+    const outputs = await mapConcurrent(pending, async ({ path }) => {
+      try { return await readCommand(path); } catch { return undefined; }
+    });
+    const next: PendingCommand[] = [];
+    for (let index = 0; index < pending.length; index += 1) {
+      const output = outputs[index];
+      if (!output?.trim()) continue;
+      const current = pending[index];
+      const command = parseCommand(current.path, output, current.summary);
+      references.set(current.path.join("\0"), command);
+      for (const subcommand of command.subcommands) {
+        const path = [...current.path, subcommand.syntax];
+        const key = path.join("\0");
+        if (!requested.has(key)) next.push({ path, summary: subcommand.description });
+      }
+    }
+    pending = next;
+  }
+
+  const all: CommandReference[] = [];
+  const append = (path: string[]) => {
+    const command = references.get(path.join("\0"));
+    if (!command) return;
+    all.push(command);
+    for (const subcommand of command.subcommands) append([...path, subcommand.syntax]);
+  };
+  for (const { name } of commands) append([name]);
+  attributeExamples(all);
+  return formatReference(parseCommand([], rootOutput), all, rootOutput);
+}
+
+export function parseWorktrunkCommands(output: string): WorktrunkCommand[] {
+  return parseCommands(output).map(({ syntax, description }) => ({ name: syntax, description }));
+}
+
 function aliasStepNames(value: unknown): string[] {
   const steps: string[] = [];
   for (const entry of Array.isArray(value) ? value : [value]) {
@@ -265,18 +577,19 @@ function aliasStepNames(value: unknown): string[] {
   }
   return steps;
 }
-export function parseWorktrunkAliasMetadata(names: readonly string[], output: string): WorktrunkAlias[] {
-  const aliases = new Map(names.map((name) => [name, { name, steps: [] as string[] }]));
+export function parseWorktrunkAliases(output: string): WorktrunkAlias[] {
+  const aliases = new Map<string, WorktrunkAlias>();
   let config: unknown;
-  try { config = JSON.parse(output); } catch { return [...aliases.values()]; }
-  if (!config || typeof config !== "object") return [...aliases.values()];
+  try { config = JSON.parse(output); } catch { return []; }
+  if (!config || typeof config !== "object") return [];
   for (const source of ["user", "project"] as const) {
     const layer = (config as Record<string, any>)[source]?.config?.aliases;
     if (!layer || typeof layer !== "object") continue;
     for (const [name, value] of Object.entries(layer)) {
-      const alias = aliases.get(name);
-      if (!alias) continue;
+      if (!WORKTRUNK_ALIAS_NAME.test(name)) continue;
+      const alias = aliases.get(name) ?? { name, steps: [] };
       for (const step of aliasStepNames(value)) if (!alias.steps.includes(step)) alias.steps.push(step);
+      aliases.set(name, alias);
     }
   }
   return [...aliases.values()];
@@ -479,9 +792,10 @@ export default function extension(pi: ExtensionAPI) {
   let aliases: WorktrunkAlias[] = [];
   let installedCommands: WorktrunkCommand[] = [];
   let installedVersion: string | undefined;
+  let worktrunkReference = "";
   let pendingContinuation: PendingContinuation | undefined;
   let placementInFlight = false;
-  const commandNames = new Set<string>(WORKTRUNK_COMMANDS);
+  const commandNames = new Set<string>();
   const aliasNames = new Set<string>();
 
   async function readCommonDir(cwd: string, signal?: AbortSignal): Promise<string | undefined> {
@@ -534,20 +848,48 @@ export default function extension(pi: ExtensionAPI) {
     aliases = [];
     installedCommands = [];
     installedVersion = undefined;
+    worktrunkReference = "";
+    commandNames.clear();
     aliasNames.clear();
     let help: WtResult;
-    try { help = await runWt(["--help"], { cwd: ctx.cwd, cwdMode: "repository-read" }); } catch { return; }
-    if (help.code !== 0) return;
-    installedCommands = parseWorktrunkCommands(help.stdout ?? "");
-    for (const { name } of installedCommands) commandNames.add(name);
-    for (const name of parseWorktrunkAliasNames(help.stdout ?? "")) aliasNames.add(name);
-    aliases = [...aliasNames].map((name) => ({ name, steps: [] }));
     try {
-      const version = await runWt(["--version"], { cwd: ctx.cwd, cwdMode: "repository-read" });
-      if (version.code === 0) installedVersion = version.stdout?.trim();
-    } catch {}
-    if (!aliases.length) return;
-    try { aliases = parseWorktrunkAliasMetadata([...aliasNames], await client.settings(ctx.cwd, ctx.signal)); } catch {}
+      help = await runWt(["--help-md"], {
+        cwd: ctx.cwd,
+        signal: ctx.signal,
+        timeout: HELP_PROBE_TIMEOUT_MS,
+        cwdMode: "repository-read",
+      });
+    } catch { return; }
+    if (help.code !== 0) return;
+    const rootOutput = help.stdout ?? "";
+    installedCommands = parseWorktrunkCommands(rootOutput);
+    for (const { name } of installedCommands) commandNames.add(name);
+
+    const [version, reference, settings] = await Promise.all([
+      runWt(["--version"], {
+        cwd: ctx.cwd,
+        signal: ctx.signal,
+        timeout: HELP_PROBE_TIMEOUT_MS,
+        cwdMode: "repository-read",
+      }).catch(() => undefined),
+      buildReference(installedCommands, rootOutput, async (path) => {
+        const help = await runWt(
+          [...path, "--help-md"],
+          {
+            cwd: ctx.cwd,
+            signal: ctx.signal,
+            timeout: HELP_PROBE_TIMEOUT_MS,
+            cwdMode: "repository-read",
+          },
+        );
+        return help.code === 0 && help.stdout?.trim() ? help.stdout : undefined;
+      }).catch(() => ""),
+      client.settings(ctx.cwd, ctx.signal).catch(() => undefined),
+    ]);
+    if (version?.code === 0) installedVersion = version.stdout?.trim();
+    worktrunkReference = reference;
+    if (settings !== undefined) aliases = parseWorktrunkAliases(settings);
+    for (const { name } of aliases) aliasNames.add(name);
   }
   function emit(ctx: ExtensionCommandContext, message: string, level: "info" | "warning" | "error") {
     if (ctx.mode === "print") process.stdout.write(`${message}\n`);
@@ -730,14 +1072,6 @@ export default function extension(pi: ExtensionAPI) {
   });
 
   function registerTool() {
-    const additionalCommands = installedCommands.filter(({ name }) =>
-      !(WORKTRUNK_COMMANDS as readonly string[]).includes(name));
-    const installedCatalog = additionalCommands.length
-      ? `\n\nAdditional commands reported by the installed Worktrunk:\n${additionalCommands.map(({ name, description }) => [
-        `- ${name}: ${description}`,
-        `  Help: ${JSON.stringify({ command: name, args: ["--help"] })}`,
-      ].join("\n")).join("\n")}`
-      : "";
     const aliasCatalog = aliases.length
       ? `\n\nConfigured aliases:\n${aliases.map(({ name, steps }) => [
         `- ${name}: ${steps.length ? steps.join(" -> ") : "no pipeline metadata available"}`,
@@ -745,22 +1079,26 @@ export default function extension(pi: ExtensionAPI) {
       ].join("\n")).join("\n")}`
       : "";
     const commandChoices = [...new Set([...commandNames, ...aliasNames])];
-    const versions = installedVersion && installedVersion !== WORKTRUNK_REFERENCE_VERSION
-      ? ` Bundled reference: ${WORKTRUNK_REFERENCE_VERSION}; installed: ${installedVersion}.`
-      : ` Reference version: ${WORKTRUNK_REFERENCE_VERSION}.`;
+    const versionNotice = installedVersion
+      ? ` Reference generated from installed ${installedVersion}.`
+      : "";
+    const referenceCatalog = worktrunkReference ? `\n\n${worktrunkReference}` : "";
+    const commandSchema = commandChoices.length
+      ? StringEnum(commandChoices, {
+        description: "Built-in Worktrunk command or configured alias to run.",
+      })
+      : Type.String({ description: "Worktrunk command or configured alias to run." });
     pi.registerTool({
       name: "worktrunk",
       label: "Worktrunk",
-      description: `Run Worktrunk commands using the complete built-in command, option, and example reference below. The command's remaining arguments pass directly to wt without shell expansion. Commands that identify one destination move the Pi session there.${versions}\n\n${WORKTRUNK_REFERENCE}${installedCatalog}${aliasCatalog}`,
-      promptSnippet: "Run Worktrunk commands using the complete built-in command, option, and example reference",
+      description: `Run Worktrunk commands using the command reference generated from the installed binary. The command's remaining arguments pass directly to wt without shell expansion. Commands that identify one destination move the Pi session there.${versionNotice}${referenceCatalog}${aliasCatalog}`,
+      promptSnippet: "Run Worktrunk commands using the installed command, option, and example reference",
       promptGuidelines: [
         "Use worktrunk for Worktrunk commands. Select a command and its remaining arguments from the worktrunk reference and examples.",
         "The worktrunk tool moves the session automatically when Worktrunk identifies one destination.",
       ],
       parameters: Type.Object({
-        command: StringEnum(commandChoices, {
-          description: "Built-in Worktrunk command or configured alias to run.",
-        }),
+        command: commandSchema,
         args: Type.Optional(Type.Array(Type.String(), {
           description: "Arguments after the Worktrunk command, in CLI order and without shell expansion.",
         })),

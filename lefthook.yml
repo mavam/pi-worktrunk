@@ -6,8 +6,5 @@ pre-push:
     changelog-validate:
       glob: "changelog/**"
       run: uvx tenzir-ship validate --lenient
-    worktrunk-reference:
-      glob: "{scripts/generate-worktrunk-reference.ts,worktrunk-reference.ts}"
-      run: npm run check-reference
     actionlint:
       run: if command -v actionlint >/dev/null; then actionlint; fi
