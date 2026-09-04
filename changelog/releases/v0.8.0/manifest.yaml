@@ -1,0 +1,10 @@
+created: 2026-09-04
+title: Cleaner sessions and runtime command references
+intro: >-
+  This release keeps Worktrunk session transitions compact and easy to scan while
+  making the agent tool's command reference match the installed Worktrunk version
+  automatically. Together, these improvements provide cleaner tool output and eliminate
+  release coupling for new Worktrunk commands.
+source:
+  mode: sync-stable-queue
+  previous_stable: v0.7.0

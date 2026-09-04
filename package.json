@@ -1,6 +1,6 @@
 {
   "name": "pi-worktrunk",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Worktrunk commands, session placement, status, and agent tools for pi",
   "type": "module",
   "files": [
