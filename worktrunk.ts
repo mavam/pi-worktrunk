@@ -909,7 +909,9 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
       content:
         `Worktrunk invocation \`wt ${invocation.args.join(" ")}\` ${status} ` +
         `(exit ${execution.result.code}).\n\n${output}\n\n` +
-        "Continue the original task in this worktree. Do not repeat the Worktrunk invocation.",
+        (status === "failed"
+          ? "Read the error and adapt your approach, then continue the original task. Do not blindly repeat the failed invocation."
+          : "Continue the original task in this worktree. Do not repeat the Worktrunk invocation."),
       display: false,
     } as const;
   }
@@ -985,8 +987,12 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
         return { ...base, moved: true, canContinue: true };
       }
     } catch (error) {
-      emit(ctx, error instanceof Error ? error.message : String(error), "error");
-      return { ...base, canContinue: false };
+      const message = error instanceof Error ? error.message : String(error);
+      emit(ctx, message, "error");
+      base.output = [output, message].filter(Boolean).join("\n\n");
+      base.result = { ...result, code: result.code || -1 };
+      // A rejected directive or cancelled session switch is recoverable when
+      // the source worktree is still usable. Return the diagnostic to the model.
     }
     const currentCommonDir = await readCommonDir(ctx.cwd);
     base.canContinue = Boolean(identity && currentCommonDir &&
@@ -1004,6 +1010,7 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
     },
     async handler(input, ctx) {
       let modelOrigin = false;
+      let modelInvocation: Invocation | undefined;
       try {
         const received = parseWtInvocation(input);
         const marker = received.args.at(-1);
@@ -1031,13 +1038,22 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
         if (nonce && !modelOrigin) {
           throw new WorktrunkError("Invalid or expired model continuation token.");
         }
-        if (modelOrigin) pendingContinuation = undefined;
+        if (modelOrigin) {
+          pendingContinuation = undefined;
+          modelInvocation = invocation;
+        }
         const execution = await executeInvocation(invocation, ctx, modelOrigin);
         if (modelOrigin && !execution.moved && execution.canContinue) {
           pi.sendMessage(continuationMessage(invocation, execution), { triggerTurn: true });
         }
       } catch (error) {
-        emit(ctx, error instanceof Error ? error.message : String(error), "error");
+        const message = error instanceof Error ? error.message : String(error);
+        emit(ctx, message, "error");
+        if (modelInvocation && await readCommonDir(ctx.cwd)) {
+          pi.sendMessage(continuationMessage(modelInvocation, {
+            result: { code: -1 }, output: message, moved: false, canContinue: true,
+          }), { triggerTurn: true });
+        }
       } finally {
         if (modelOrigin) placementInFlight = false;
       }
@@ -1134,7 +1150,12 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
               }
             }
           } catch (error) {
-            stopReason = error instanceof Error ? error.message : String(error);
+            const message = error instanceof Error ? error.message : String(error);
+            const current = await readCommonDir(ctx.cwd);
+            if (current && sameRepositoryIdentity(identity, repositoryIdentity(current))) {
+              throw new WorktrunkError(boundedModelOutput([output, message].filter(Boolean).join("\n\n")));
+            }
+            stopReason = message;
           }
           if (stopReason) {
             ctx.abort();
