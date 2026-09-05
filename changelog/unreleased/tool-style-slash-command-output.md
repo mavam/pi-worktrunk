@@ -1,6 +1,8 @@
 ---
 title: Tool-style slash command output
 type: change
+prs:
+  - 18
 authors:
   - mavam
 created: 2026-09-05T16:08:37.915879Z
