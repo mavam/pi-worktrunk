@@ -172,13 +172,15 @@ for (const scenario of [
         assert.equal("trail" in details, false);
       } else if (scenario === "cancel-switch") {
         assert.ok(requested);
-        assert.equal(continuations.length, 0);
+        assert.equal(continuations.length, 1);
+        assert.match(continuations[0].content, /session switching was cancelled/);
         assert.match(notifications.join("\n"), /cancelled/);
       } else {
         assert.equal(requested, "");
         if (["foreign-repository", "malformed"].includes(scenario)) {
           assert.match(notifications.join("\n"), /Rejected Worktrunk destination/);
-          assert.equal(continuations.length, 0);
+          assert.equal(continuations.length, 1);
+          assert.match(continuations[0].content, /Rejected Worktrunk destination/);
         }
         if (scenario === "no-directive-placeholder") {
           assert.match(notifications.join("\n"), /no longer usable/);
