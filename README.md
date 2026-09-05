@@ -17,7 +17,7 @@ pi install npm:pi-worktrunk
 /wt list
 /wt switch main
 /wt switch --create fix/parser
-/wt land
+/wt remove
 /wt config show
 ```
 
@@ -31,7 +31,7 @@ Two bare commands open compact Pi interfaces:
 
 Pi follows Worktrunk's directory-change directive, using the same protocol as
 Worktrunk's shell integration. This includes requests from configured aliases
-and foreground hooks. For example, when `/wt land` removes your feature worktree
+and foreground hooks. For example, when `/wt remove` removes your feature worktree
 and requests the main worktree, Pi continues there without waiting for background
 cleanup. Existing destination subdirectories are preserved.
 
@@ -45,7 +45,8 @@ remains available through `/resume`.
 
 ### 🏷️ Worktrunk aliases
 
-Configured aliases pass directly through `/wt`:
+Your configured aliases pass directly through `/wt`. For example, if you define
+aliases named `land` and `deploy`, you can run:
 
 ```text
 /wt land
