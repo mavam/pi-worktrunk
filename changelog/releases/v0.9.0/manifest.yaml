@@ -1,0 +1,9 @@
+created: 2026-09-05
+title: Render slash commands as Worktrunk cards
+intro: "Worktrunk now renders completed slash commands as persistent, tool-style cards\
+  \ in the terminal transcript, making command output easier to scan and revisit.\
+  \ Pi also follows Worktrunk\u2019s directory decisions reliably across aliases,\
+  \ hooks, and worktree removal."
+source:
+  mode: sync-stable-queue
+  previous_stable: v0.8.0
