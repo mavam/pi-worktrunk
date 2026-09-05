@@ -12,9 +12,10 @@ import {
   type ExtensionContext,
   type SessionEntry,
   type SessionHeader,
+  type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { Text } from "@earendil-works/pi-tui";
+import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 export const MARKERS = { working: "🤖", waiting: "💬" } as const;
@@ -766,7 +767,24 @@ function sameRepositoryIdentity(left?: RepositoryIdentity, right?: RepositoryIde
   return Boolean(left && right && left.commonDir === right.commonDir && left.device === right.device && left.inode === right.inode);
 }
 
+const COMMAND_ENTRY_TYPE = "pi-worktrunk-command-result";
+type CommandDisplay = { args: string[]; output: string; isError: boolean };
+
+function renderWorktrunkCall(args: string[], theme: Theme): Text {
+  let text = theme.fg("toolTitle", theme.bold("Worktrunk"));
+  if (args.length) text += ` ${theme.fg("accent", args.join(" "))}`;
+  return new Text(text, 0, 0);
+}
+
 export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedWt) {
+  pi.registerEntryRenderer<CommandDisplay>(COMMAND_ENTRY_TYPE, (entry, _options, theme) => {
+    if (!entry.data) return undefined;
+    const { args, output, isError } = entry.data;
+    const box = new Box(1, 1, (text) => theme.bg(isError ? "toolErrorBg" : "toolSuccessBg", text));
+    box.addChild(renderWorktrunkCall(args, theme));
+    box.addChild(new Text(output, 0, 0));
+    return box;
+  });
   const renderTransition: Parameters<ExtensionAPI["registerMessageRenderer"]>[1] =
     (message, { outputPad }, theme) => {
     const details = message.details as Partial<SessionTransitionDetails> | undefined;
@@ -868,6 +886,17 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
     else if (ctx.mode === "json") pi.sendMessage({ customType: "pi-worktrunk-command", content: message, display: true, details: { level } });
     else ctx.ui.notify(message, level);
   }
+  function displayCommand(ctx: ExtensionCommandContext, args: string[], output: string, isError: boolean, modelOrigin: boolean) {
+    if (!modelOrigin && ctx.mode === "tui") {
+      // Persist before session placement so linked sessions inherit the card.
+      // Entries are display-only: slash commands must not trigger an agent turn.
+      pi.appendEntry<CommandDisplay>(COMMAND_ENTRY_TYPE, {
+        args, output: boundedModelOutput(output), isError,
+      });
+    } else if (output) {
+      emit(ctx, output, isError ? "error" : "info");
+    }
+  }
   function continuationMessage(invocation: Invocation, execution: Execution) {
     const status = execution.result.code === 0 && !execution.result.killed
       ? "completed successfully"
@@ -906,10 +935,10 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
     const interactive = ctx.mode !== "print" && ctx.mode !== "json";
     if (!modelOrigin && isBareCommand(invocation, "list") && interactive && ctx.hasUI) {
       const worktrees = await client.list(ctx.cwd, ctx.signal);
-      if (!worktrees.length) ctx.ui.notify("No worktrees found.", "info");
+      if (!worktrees.length) displayCommand(ctx, invocation.args, "No worktrees found.", false, modelOrigin);
       else {
         const selected = await chooseWorktree(ctx, "Select a worktree to inspect", worktrees);
-        if (selected) ctx.ui.notify(formatWorktreeStatus(selected), "info");
+        if (selected) displayCommand(ctx, invocation.args, formatWorktreeStatus(selected), false, modelOrigin);
       }
       return { result: { code: 0 }, output: "", moved: false, canContinue: true };
     }
@@ -932,7 +961,7 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
     try { result = await invoke(args, { cwd: ctx.cwd, signal: ctx.signal }); }
     catch (error) { result = { code: -1, stderr: error instanceof Error ? error.message : String(error) }; }
     const output = [result.stdout?.trimEnd(), result.stderr?.trimEnd()].filter(Boolean).join("\n");
-    if (output) emit(ctx, output, result.code === 0 ? "info" : "error");
+    displayCommand(ctx, args, output, result.code !== 0 || Boolean(result.killed), modelOrigin);
     const base: Execution = { result, output, moved: false, canContinue: false };
     const continuation = modelOrigin ? continuationMessage(invocation, base) : undefined;
 
@@ -1142,10 +1171,8 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
         };
       },
       renderCall(args, theme) {
-        let text = theme.fg("toolTitle", theme.bold("Worktrunk"));
         const invocation = [args.command, ...(args.args ?? [])].filter((value): value is string => typeof value === "string");
-        if (invocation.length) text += ` ${theme.fg("accent", invocation.join(" "))}`;
-        return new Text(text, 0, 0);
+        return renderWorktrunkCall(invocation, theme);
       },
       renderResult(result, _options, _theme, context) {
         const details = result.details as { code?: unknown } | undefined;

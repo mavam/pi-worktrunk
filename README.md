@@ -24,6 +24,11 @@ pi install npm:pi-worktrunk
 Pi passes arguments directly to Worktrunk. Worktrunk flags and configured aliases
 work without extension-specific syntax.
 
+In the terminal UI, completed slash commands appear as Worktrunk cards with the
+same header and success/error styling as model-invoked tools. Their output stays
+in the transcript, including after a worktree move, without triggering a model
+response.
+
 Two bare commands open compact Pi interfaces:
 
 - `/wt list` opens the worktree inspector.
