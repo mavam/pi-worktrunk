@@ -1,6 +1,8 @@
 ---
 title: Continued tasks after recoverable Worktrunk errors
 type: bugfix
+prs:
+  - 19
 authors:
   - mavam
 created: 2026-09-05T19:31:35.960573Z
