@@ -228,6 +228,7 @@ function baseApi(options: {
     registerCommand(name: string, definition: any) { options.commands.set(name, definition); },
     registerTool(definition: any) { options.tools.set(definition.name, definition); },
     registerMessageRenderer(name: string, renderer: any) { options.renderer?.set(name, renderer); },
+    registerEntryRenderer() {},
     appendEntry() {},
     sendMessage(message: any, sendOptions: any) { options.messages?.push({ message, options: sendOptions }); },
     sendUserMessage(text: string, sendOptions: any) { options.sent?.push({ text, options: sendOptions }); },

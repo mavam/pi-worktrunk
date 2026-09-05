@@ -124,6 +124,7 @@ for (const scenario of [
         registerCommand(name: string, command: any) { commands.set(name, command); },
         registerTool(tool: any) { tools.set(tool.name, tool); },
         registerMessageRenderer() {},
+        registerEntryRenderer() {},
         sendUserMessage(text: string) { sent.push(text); },
         sendMessage(message: any) { continuations.push(message); },
         async exec(program: string, args: string[], options: any) {
