@@ -17,7 +17,7 @@ pi install npm:pi-worktrunk
 /wt list
 /wt switch main
 /wt switch --create fix/parser
-/wt land
+/wt remove
 /wt config show
 ```
 
@@ -29,17 +29,24 @@ Two bare commands open compact Pi interfaces:
 - `/wt list` opens the worktree inspector.
 - `/wt switch` opens the worktree picker and moves to the selected worktree.
 
-After other successful commands, Pi moves when Worktrunk reports a destination
-or creates exactly one worktree. If the command removes the current worktree,
-Pi recovers in a surviving worktree. Pi stays put when no unique destination can
-be identified or when a command fails without removing the current worktree.
+Pi follows Worktrunk's directory-change directive, using the same protocol as
+Worktrunk's shell integration. This includes requests from configured aliases
+and foreground hooks. For example, when `/wt remove` removes your feature worktree
+and requests the main worktree, Pi continues there without waiting for background
+cleanup. Existing destination subdirectories are preserved.
+
+Pi follows a valid directive even if a later hook fails, and reports the failure
+in the destination session. Without a directive, Pi stays put: it doesn't infer
+a destination from newly created worktrees or session history. Each invocation
+uses a private temporary reply file, which is deleted afterward.
 
 Each move creates a linked Pi session in the destination. The source session
 remains available through `/resume`.
 
 ### 🏷️ Worktrunk aliases
 
-Configured aliases pass directly through `/wt`:
+Your configured aliases pass directly through `/wt`. For example, if you define
+aliases named `land` and `deploy`, you can run:
 
 ```text
 /wt land
@@ -79,13 +86,17 @@ task there.
 
 ## 🧰 Requirements
 
-- Install [`wt`](https://worktrunk.dev/) and make it available on your `PATH`.
+- Install current [`wt`](https://worktrunk.dev/) with the
+  `WORKTRUNK_DIRECTIVE_CD_FILE` protocol and make it available on your `PATH`.
+- Use TUI or RPC mode for session movement. In print or JSON mode, a directory
+  request stops continuation and reports where to restart Pi.
 - Run Pi from a Git repository that Worktrunk can manage.
 
 ## 🛡️ Safety
 
-- Pi stays put rather than choosing between several destinations.
-- Recovery takes precedence when a command removes the current worktree.
+- Pi validates that a requested directory belongs to the original repository.
+- If the current directory becomes unusable without a valid directive, Pi stops
+  continuation rather than choosing a recovery destination.
 - Worktrunk retains control of hooks, project-command approvals, dirty-worktree
   checks, force flags, branch deletion, and command errors.
 - Session movement preserves the source session.

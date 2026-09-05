@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -8,7 +8,7 @@ import test from "node:test";
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
 import { createAgentSession, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 
-import extension, {
+import registerExtension, {
   MARKERS,
   buildReference,
   createMarkerUpdater,
@@ -23,6 +23,10 @@ import extension, {
   renderToolExample,
   splitShell,
 } from "./worktrunk.ts";
+
+function extension(pi: any) {
+  registerExtension(pi, (args, options) => pi.exec("wt", args, options));
+}
 
 const switchHelpMarkdown = `wt switch - Switch to a worktree; create if needed
 
@@ -227,7 +231,10 @@ function baseApi(options: {
     appendEntry() {},
     sendMessage(message: any, sendOptions: any) { options.messages?.push({ message, options: sendOptions }); },
     sendUserMessage(text: string, sendOptions: any) { options.sent?.push({ text, options: sendOptions }); },
-    exec: options.exec,
+    exec: (program: string, args: string[], execOptions: any) => {
+      if (program === "git" && args.includes("--is-inside-work-tree")) return Promise.resolve({ code: 0, stdout: "true\n" });
+      return options.exec(program, args, execOptions);
+    },
   } as any;
 }
 
@@ -348,7 +355,7 @@ test("non-interactive tools run Worktrunk before the session exits", async () =>
   extension(baseApi({
     handlers, commands, tools, sent,
     async exec(program, args, options) {
-      if (program === "git") return { code: 1, stdout: "", stderr: "" };
+      if (program === "git") return { code: 0, stdout: `${process.cwd()}\n`, stderr: "" };
       if (args[0] === "--help-md" || args[0] === "--version" || args[0] === "config") {
         return { code: 0, stdout: "" };
       }
@@ -378,27 +385,16 @@ test("non-interactive tools run Worktrunk before the session exits", async () =>
     assert.equal(result.content[0].text, "main worktree");
     assert.deepEqual(result.details, { args: ["list"], code: 0 });
 
-    await assert.rejects(
-      tools.get("worktrunk").execute(
-        `promote-${mode}`,
-        { command: "step", args: ["promote", "feature"] },
-        undefined,
-        undefined,
-        { cwd: process.cwd(), mode, hasUI: false, ui: {} },
-      ),
-      /requires TUI or RPC mode/,
+    const promoted = await tools.get("worktrunk").execute(
+      `promote-${mode}`, { command: "step", args: ["promote", "feature"] },
+      undefined, undefined, { cwd: process.cwd(), mode, hasUI: false, ui: {} },
     );
+    assert.equal(promoted.terminate, undefined);
   }
 
-  await assert.rejects(
-    tools.get("worktrunk").execute(
-      "switch",
-      { command: "switch", args: ["feature"] },
-      undefined,
-      undefined,
-      { cwd: process.cwd(), mode: "print", hasUI: false, ui: {} },
-    ),
-    /requires TUI or RPC mode/,
+  await tools.get("worktrunk").execute(
+    "switch", { command: "switch", args: ["--no-cd", "feature"] },
+    undefined, undefined, { cwd: process.cwd(), mode: "print", hasUI: false, ui: {} },
   );
 
   const large = await tools.get("worktrunk").execute(
@@ -426,7 +422,7 @@ test("non-interactive tools run Worktrunk before the session exits", async () =>
   } finally {
     await rm(removedCwd, { recursive: true, force: true });
   }
-  assert.deepEqual(calls, [["list"], ["list"], ["list", "--large"], ["remove", "current"]]);
+  assert.deepEqual(calls, [["list"], ["step", "promote", "feature"], ["list"], ["step", "promote", "feature"], ["switch", "--no-cd", "feature"], ["list", "--large"], ["remove", "current"]]);
   assert.deepEqual(sent, []);
 });
 
@@ -497,18 +493,17 @@ test("removing the current worktree aborts the remaining tool batch", async () =
   }
 });
 
-test("Worktrunk client handles relocated lists and failures", async () => {
+test("Worktrunk client reads lists and reports failures", async () => {
   const calls: string[][] = [];
   const client = createWorktrunkClient(async (args) => {
     calls.push(args);
     return {
       code: 0,
-      relocated: true,
       stdout: list([{ branch: "main", worktree: { path: "/repo", current: true } }]),
     };
   });
-  const items = await client.list("/removed");
-  assert.equal(items[0].worktree?.current, false);
+  const items = await client.list("/repo");
+  assert.equal(items[0].worktree?.current, true);
   assert.deepEqual(calls[0], ["--config-set", "list.json-schema=2", "list", "--format=json"]);
 
   const failing = createWorktrunkClient(async () => ({ code: 1, stderr: "needs approval" }));
@@ -543,7 +538,7 @@ test("create-and-switch moves and resumes model work", async () => {
         if (args.join("\0") === ["switch", "--create", "fix/parser"].join("\0")) {
           await mkdir(target);
           created = true;
-          return { code: 0, stdout: "Created fix/parser" };
+          return { code: 0, stdout: "Created fix/parser", directive: `${target}\n` };
         }
         return { code: 0, stdout: "" };
       },
@@ -566,7 +561,7 @@ test("create-and-switch moves and resumes model work", async () => {
     });
     assert.ok(wtCalls.some((args) => args.join("\0") === ["switch", "--create", "fix/parser"].join("\0")));
     const destination = SessionManager.open(switched, sessions);
-    assert.equal(destination.getCwd(), realpathSync(target));
+    assert.equal(destination.getCwd(), target);
     const transition = destination.getEntries().at(-1);
     assert.equal(transition?.type, "custom_message");
     if (transition?.type === "custom_message") {
@@ -691,7 +686,7 @@ test("ambiguous creations stay in the source session", async () => {
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("a failed command that removes the cwd recovers and resumes with the failure", async () => {
+test("a failed command that removes the cwd follows its directive and resumes with the failure", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-recovery-"));
   const main = join(root, "repo");
   const source = join(root, "repo.feature");
@@ -723,7 +718,7 @@ test("a failed command that removes the cwd recovers and resumes with the failur
       ]) };
       if (args[0] === "land") {
         await rm(source, { recursive: true, force: true });
-        return { code: 1, stderr: "land failed after cleanup" };
+        return { code: 1, stderr: "land failed after cleanup", directive: `${main}\n` };
       }
       return { code: 0, stdout: "" };
     } }));
@@ -746,7 +741,7 @@ test("a failed command that removes the cwd recovers and resumes with the failur
       },
       ui: { notify() {} },
     });
-    assert.equal(SessionManager.open(switched, sessions).getCwd(), realpathSync(main));
+    assert.equal(SessionManager.open(switched, sessions).getCwd(), main);
     assert.match(continuation.message.content, /failed \(exit 1\).*land failed after cleanup/s);
     assert.equal(continuation.options.triggerTurn, true);
   } finally { await rm(root, { recursive: true, force: true }); }

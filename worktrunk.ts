@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { existsSync, realpathSync, statSync, writeFileSync } from "node:fs";
-import { basename, dirname, resolve } from "node:path";
+import { basename, resolve, join, isAbsolute } from "node:path";
 
 import {
   SessionManager,
@@ -21,15 +24,88 @@ type WtResult = {
   stderr?: string;
   code: number;
   killed?: boolean;
-  relocated?: boolean;
+  directive?: string;
 };
 type RunWtOptions = {
   cwd?: string;
   signal?: AbortSignal;
   timeout?: number;
-  cwdMode?: "repository-read";
 };
 type RunWt = (args: string[], options?: RunWtOptions) => Promise<WtResult>;
+
+/** The same one-invocation reply channel used by Worktrunk's shell wrappers. */
+export async function runDirectedWt(args: string[], options: RunWtOptions = {}, command = "wt"): Promise<WtResult> {
+  const directory = await mkdtemp(join(tmpdir(), "pi-worktrunk-"));
+  const file = join(directory, "cd");
+  try {
+    await writeFile(file, "", { mode: 0o600 });
+    const result = await new Promise<WtResult>((resolveResult) => {
+      if (options.signal?.aborted) {
+        resolveResult({ code: -1, killed: true });
+        return;
+      }
+      const child = spawn(command, args, {
+        cwd: options.cwd,
+        env: {
+          ...process.env,
+          WORKTRUNK_DIRECTIVE_CD_FILE: file,
+          // Pi is the caller, not a shell that may have launched Pi elsewhere.
+          WORKTRUNK_SHELL_CWD: options.cwd ?? process.cwd(),
+          PWD: options.cwd ?? process.cwd(),
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "", stderr = "", killed = false, settled = false, exited = false;
+      let exitCode: number | null = null;
+      let forceKill: ReturnType<typeof setTimeout> | undefined;
+      let drain: ReturnType<typeof setTimeout> | undefined;
+      const cancel = () => {
+        if (killed || exited) return;
+        killed = true;
+        child.kill("SIGTERM");
+        forceKill = setTimeout(() => child.kill("SIGKILL"), 5000);
+      };
+      const finish = (code: number | null) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        clearTimeout(forceKill);
+        clearTimeout(drain);
+        options.signal?.removeEventListener("abort", cancel);
+        child.stdout.destroy();
+        child.stderr.destroy();
+        resolveResult({ stdout, stderr, code: code ?? -1, killed });
+      };
+      // Detached hooks may retain the output pipes. After exit, drain until idle
+      // rather than waiting forever for their handles to close (as Pi does).
+      const drainAfterExit = () => {
+        if (!exited || settled) return;
+        clearTimeout(drain);
+        drain = setTimeout(() => finish(exitCode), 100);
+      };
+      child.stdout.setEncoding("utf8").on("data", (data: string) => { stdout += data; drainAfterExit(); });
+      child.stderr.setEncoding("utf8").on("data", (data: string) => { stderr += data; drainAfterExit(); });
+      child.on("error", (error) => { stderr += error.message; finish(-1); });
+      options.signal?.addEventListener("abort", cancel, { once: true });
+      const timer = options.timeout && options.timeout > 0 ? setTimeout(cancel, options.timeout) : undefined;
+      child.on("exit", (code) => { exited = true; exitCode = code; clearTimeout(forceKill); drainAfterExit(); });
+      child.on("close", finish);
+      if (options.signal?.aborted) cancel();
+    });
+    return { ...result, directive: await readFile(file, "utf8") };
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+export function parseDirectoryDirective(raw: string): string | undefined {
+  if (!raw) return undefined;
+  const path = raw.replace(/\r?\n$/, "");
+  if (!isAbsolute(path) || /[\r\n\0]/.test(path)) {
+    throw new Error(`Rejected Worktrunk destination: ${JSON.stringify(raw)}`);
+  }
+  return path;
+}
 
 export type SessionSnapshot = { header: SessionHeader; entries: SessionEntry[] };
 type Relation = { ahead?: number; behind?: number };
@@ -65,7 +141,6 @@ type SessionTransitionDetails = {
   kind: SessionTransitionKind;
   source: SessionLocation;
   target: SessionLocation;
-  trail: SessionLocation[];
   sourceSession: string;
   destinationSession: string;
 };
@@ -89,7 +164,6 @@ const LEGACY_SESSION_TRANSITION_MESSAGE = "pi-worktrunk-session-transition";
 const CONTINUATION_MESSAGE_TYPE = "pi-worktrunk-continuation";
 const MAX_CONTINUATION_OUTPUT = 50_000;
 const CONTINUATION_ARG_PREFIX = "__pi_worktrunk_continuation=";
-const REPOSITORY_IDENTITY_ENTRY = "pi-worktrunk-repository";
 const WORKTRUNK_ALIAS_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const MAX_REFERENCE_BYTES = 30_000;
 const MAX_EXAMPLES_PER_COMMAND = 3;
@@ -177,25 +251,6 @@ function parseWorktreeList(output: string): WorktreeItem[] {
 function canonicalPath(path: string): string {
   try { return realpathSync(path); } catch { return resolve(path); }
 }
-function itemForPath(items: readonly WorktreeItem[], path: string): WorktreeItem | undefined {
-  const target = canonicalPath(path);
-  return items.find((item) => item.worktree?.path && canonicalPath(item.worktree.path) === target);
-}
-function resolveWorktree(items: readonly WorktreeItem[], ref: string): WorktreeItem | undefined {
-  const matches = items.filter((item) =>
-    item.branch === ref || item.worktree?.path === ref ||
-    (item.worktree?.path && basename(item.worktree.path) === ref));
-  const paths = new Set(matches.flatMap((item) => item.worktree?.path ? [canonicalPath(item.worktree.path)] : []));
-  return paths.size === 1 ? matches[0] : undefined;
-}
-function uniqueCreatedTarget(before: readonly WorktreeItem[], after: readonly WorktreeItem[]): WorktreeItem | undefined {
-  const previous = new Set(before.flatMap((item) => item.worktree?.path ? [canonicalPath(item.worktree.path)] : []));
-  const created = after.filter((item) => item.worktree?.path && !previous.has(canonicalPath(item.worktree.path)));
-  return created.length === 1 ? created[0] : undefined;
-}
-function worktreeLocation(item: WorktreeItem | undefined, fallback: string, commonDir?: string): SessionLocation {
-  return { branch: item?.branch ?? null, path: canonicalPath(item?.worktree?.path ?? fallback), ...(commonDir ? { commonDir } : {}) };
-}
 
 function approvalHint(output: string): string {
   return /needs approval|cannot prompt for approval/i.test(output)
@@ -215,7 +270,7 @@ function formatWtFailure(args: readonly string[], result: WtResult, cwd: string)
   if (result.killed) return `wt ${args.join(" ")} was cancelled.`;
   if (!existsSync(cwd)) return missingCwdMessage(cwd);
   if (!output || result.code === 127 || /\bENOENT\b/i.test(output)) {
-    return "Could not start Worktrunk (`wt`). Install Worktrunk 0.70 or later and ensure it is available on `PATH`.";
+    return "Could not start Worktrunk (`wt`). Install current Worktrunk and ensure it is available on `PATH`.";
   }
   return `wt ${args.join(" ")} failed: ${output}${approvalHint(output)}`;
 }
@@ -225,15 +280,14 @@ export function createWorktrunkClient(runWt: RunWt) {
     async list(cwd: string, signal?: AbortSignal): Promise<WorktreeItem[]> {
       const result = await runWt(
         ["--config-set", "list.json-schema=2", "list", "--format=json"],
-        { cwd, signal, cwdMode: "repository-read" },
+        { cwd, signal },
       );
       if (result.code !== 0) throw new WorktrunkError(formatWtFailure(["list"], result, cwd));
       const items = parseWorktreeList(result.stdout ?? "");
-      if (result.relocated) for (const item of items) if (item.worktree) item.worktree.current = false;
       return items;
     },
     async settings(cwd: string, signal?: AbortSignal): Promise<string> {
-      const result = await runWt(["config", "show", "--format=json"], { cwd, signal, cwdMode: "repository-read" });
+      const result = await runWt(["config", "show", "--format=json"], { cwd, signal });
       if (result.code !== 0) throw new WorktrunkError(formatWtFailure(["config", "show", "--format=json"], result, cwd));
       return result.stdout?.trim() ?? "";
     },
@@ -652,33 +706,6 @@ function quoteArgument(value: string): string {
 function isBareCommand(invocation: Invocation, command: string): boolean {
   return invocation.command === command && invocation.commandArgs.length === 0;
 }
-function exactSwitchTarget(invocation: Invocation): string | undefined {
-  if (invocation.command !== "switch" || invocation.commandArgs.length !== 1) return undefined;
-  const value = invocation.commandArgs[0];
-  return value.startsWith("-") ? undefined : value;
-}
-function positionalCommandArgs(invocation: Invocation): string[] {
-  const result: string[] = [];
-  for (let index = 0; index < invocation.commandArgs.length; index += 1) {
-    const value = invocation.commandArgs[index];
-    if (GLOBAL_OPTIONS_WITH_VALUES.has(value)) { index += 1; continue; }
-    if (
-      (value.startsWith("-C") && value !== "-C") ||
-      value.startsWith("--config=") ||
-      value.startsWith("--config-set=") ||
-      value.startsWith("-")
-    ) continue;
-    result.push(value);
-  }
-  return result;
-}
-function nonInteractivePlacementCommand(invocation: Invocation): string | undefined {
-  if (invocation.command === "switch") return "wt switch";
-  if (invocation.command === "step" && positionalCommandArgs(invocation)[0] === "promote") {
-    return "wt step promote";
-  }
-  return undefined;
-}
 
 function relationText(relation?: Relation): string { return `ahead ${relation?.ahead ?? 0}, behind ${relation?.behind ?? 0}`; }
 function changeText(item: WorktreeItem): string {
@@ -711,34 +738,7 @@ async function chooseWorktree(ctx: ExtensionCommandContext, title: string, items
   return index < 0 ? undefined : items[index];
 }
 
-function readSessionTrail(ctx: ExtensionCommandContext): SessionLocation[] {
-  for (const entry of [...ctx.sessionManager.getEntries()].reverse()) {
-    if (
-      entry.type !== "custom_message" ||
-      ![SESSION_TRANSITION_MESSAGE, LEGACY_SESSION_TRANSITION_MESSAGE].includes(entry.customType) ||
-      !entry.details ||
-      typeof entry.details !== "object"
-    ) continue;
-    const trail = (entry.details as { trail?: unknown }).trail;
-    if (Array.isArray(trail)) return trail.filter((value): value is SessionLocation =>
-      Boolean(value && typeof value === "object" && typeof value.path === "string" && (typeof value.branch === "string" || value.branch === null)));
-  }
-  return [];
-}
-function survivingTrail(trail: readonly SessionLocation[], worktrees: readonly WorktreeItem[]): SessionLocation[] {
-  return trail.filter((location) => itemForPath(worktrees, location.path));
-}
-function recoveryTarget(trail: readonly SessionLocation[], worktrees: readonly WorktreeItem[]): { target?: WorktreeItem; trail: SessionLocation[] } {
-  for (let index = trail.length - 1; index >= 0; index -= 1) {
-    const target = itemForPath(worktrees, trail[index].path);
-    if (target) return { target, trail: trail.slice(0, index) };
-  }
-  return { target: worktrees.find((item) => item.worktree?.main) ?? worktrees.find((item) => item.worktree?.path), trail: [] };
-}
-function nextTrail(trail: readonly SessionLocation[], source: SessionLocation): SessionLocation[] {
-  return [...trail, source].slice(-32);
-}
-function createLinkedSession(ctx: ExtensionCommandContext, source: SessionLocation, target: SessionLocation, trail: SessionLocation[], kind: SessionTransitionKind): string {
+function createLinkedSession(ctx: ExtensionCommandContext, source: SessionLocation, target: SessionLocation): string {
   const sourceSession = ctx.sessionManager.getSessionFile();
   if (!sourceSession) throw new WorktrunkError("Cannot move an ephemeral Pi session.");
   let snapshot: SessionSnapshot | undefined;
@@ -754,7 +754,7 @@ function createLinkedSession(ctx: ExtensionCommandContext, source: SessionLocati
     SESSION_TRANSITION_MESSAGE,
     "",
     true,
-    { kind, source, target, trail, sourceSession, destinationSession } satisfies SessionTransitionDetails,
+    { kind: "move", source, target, sourceSession, destinationSession } satisfies SessionTransitionDetails,
   );
   return destinationSession;
 }
@@ -765,11 +765,8 @@ function repositoryIdentity(commonDir: string): RepositoryIdentity | undefined {
 function sameRepositoryIdentity(left?: RepositoryIdentity, right?: RepositoryIdentity): boolean {
   return Boolean(left && right && left.commonDir === right.commonDir && left.device === right.device && left.inode === right.inode);
 }
-function gitWorktreePaths(output: string): string[] {
-  return output.split("\0").filter((field) => field.startsWith("worktree ")).map((field) => field.slice(9));
-}
 
-export default function extension(pi: ExtensionAPI) {
+export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedWt) {
   const renderTransition: Parameters<ExtensionAPI["registerMessageRenderer"]>[1] =
     (message, { outputPad }, theme) => {
     const details = message.details as Partial<SessionTransitionDetails> | undefined;
@@ -788,7 +785,6 @@ export default function extension(pi: ExtensionAPI) {
   pi.registerMessageRenderer?.(LEGACY_SESSION_TRANSITION_MESSAGE, renderTransition);
 
   const execWt: RunWt = (args, options) => pi.exec("wt", args, options);
-  let storedRepositoryIdentity: RepositoryIdentity | undefined;
   let aliases: WorktrunkAlias[] = [];
   let installedCommands: WorktrunkCommand[] = [];
   let installedVersion: string | undefined;
@@ -799,50 +795,29 @@ export default function extension(pi: ExtensionAPI) {
   const aliasNames = new Set<string>();
 
   async function readCommonDir(cwd: string, signal?: AbortSignal): Promise<string | undefined> {
-    if (!existsSync(cwd)) return undefined;
-    const result = await pi.exec("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd, signal });
-    return result.code === 0 && result.stdout.trim() ? resolve(cwd, result.stdout.trim()) : undefined;
+    try {
+      if (!statSync(cwd).isDirectory()) return undefined;
+      const inside = await pi.exec("git", ["rev-parse", "--is-inside-work-tree"], { cwd, signal, timeout: 5000 });
+      if (inside.code !== 0 || inside.stdout.trim() !== "true") return undefined;
+      const result = await pi.exec("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd, signal, timeout: 5000 });
+      return result.code === 0 && result.stdout.trim() ? canonicalPath(resolve(cwd, result.stdout.trim())) : undefined;
+    } catch { return undefined; }
   }
-  async function findRepositoryWorktree(signal?: AbortSignal): Promise<string | undefined> {
-    const identity = storedRepositoryIdentity;
-    if (!identity || !sameRepositoryIdentity(identity, repositoryIdentity(identity.commonDir))) return undefined;
-    const result = await pi.exec("git", ["--git-dir", identity.commonDir, "worktree", "list", "--porcelain", "-z"], { cwd: dirname(identity.commonDir), signal });
-    if (result.code !== 0) return undefined;
-    for (const path of gitWorktreePaths(result.stdout)) {
-      if (existsSync(path) && (await readCommonDir(path, signal)) === identity.commonDir) return path;
+  async function directedDestination(raw: string | undefined, identity: RepositoryIdentity | undefined): Promise<string | undefined> {
+    const path = parseDirectoryDirective(raw ?? "");
+    if (!path) return undefined;
+    const commonDir = await readCommonDir(path);
+    if (!identity || !commonDir || !sameRepositoryIdentity(identity, repositoryIdentity(commonDir))) {
+      throw new WorktrunkError(`Rejected Worktrunk destination: ${JSON.stringify(path)} (not in the original repository).`);
     }
-    return undefined;
+    return path;
   }
-  const runWt: RunWt = async (args, options) => {
-    const { cwdMode, ...execOptions } = options ?? {};
-    if (!execOptions.cwd || existsSync(execOptions.cwd) || cwdMode !== "repository-read") return execWt(args, execOptions);
-    const fallback = await findRepositoryWorktree(execOptions.signal);
-    if (!fallback) return execWt(args, execOptions);
-    return { ...(await execWt(args, { ...execOptions, cwd: fallback })), relocated: true };
-  };
+  const runWt = execWt;
   const client = createWorktrunkClient(runWt);
   const tracker = createMarkerUpdater(execWt);
 
   async function safeList(cwd: string, signal?: AbortSignal): Promise<WorktreeItem[]> {
     try { return await client.list(cwd, signal); } catch { return []; }
-  }
-  async function restoreRepositoryIdentity(ctx: ExtensionContext) {
-    const stored = [...ctx.sessionManager.getEntries()].reverse().find((entry) => entry.type === "custom" && entry.customType === REPOSITORY_IDENTITY_ENTRY);
-    if (stored?.type === "custom" && stored.data && typeof stored.data === "object") {
-      const value = stored.data as Partial<RepositoryIdentity>;
-      if (typeof value.commonDir === "string" && typeof value.device === "number" && typeof value.inode === "number") {
-        const identity = value as RepositoryIdentity;
-        if (sameRepositoryIdentity(identity, repositoryIdentity(identity.commonDir))) storedRepositoryIdentity = identity;
-      }
-    }
-    try {
-      const commonDir = await readCommonDir(ctx.cwd, ctx.signal);
-      if (!commonDir) return;
-      const identity = repositoryIdentity(commonDir);
-      if (!identity || sameRepositoryIdentity(identity, storedRepositoryIdentity)) return;
-      storedRepositoryIdentity = identity;
-      pi.appendEntry(REPOSITORY_IDENTITY_ENTRY, identity);
-    } catch {}
   }
   async function discoverCommandsAndAliases(ctx: ExtensionContext) {
     aliases = [];
@@ -857,7 +832,6 @@ export default function extension(pi: ExtensionAPI) {
         cwd: ctx.cwd,
         signal: ctx.signal,
         timeout: HELP_PROBE_TIMEOUT_MS,
-        cwdMode: "repository-read",
       });
     } catch { return; }
     if (help.code !== 0) return;
@@ -870,7 +844,6 @@ export default function extension(pi: ExtensionAPI) {
         cwd: ctx.cwd,
         signal: ctx.signal,
         timeout: HELP_PROBE_TIMEOUT_MS,
-        cwdMode: "repository-read",
       }).catch(() => undefined),
       buildReference(installedCommands, rootOutput, async (path) => {
         const help = await runWt(
@@ -879,7 +852,6 @@ export default function extension(pi: ExtensionAPI) {
             cwd: ctx.cwd,
             signal: ctx.signal,
             timeout: HELP_PROBE_TIMEOUT_MS,
-            cwdMode: "repository-read",
           },
         );
         return help.code === 0 && help.stdout?.trim() ? help.stdout : undefined;
@@ -895,10 +867,6 @@ export default function extension(pi: ExtensionAPI) {
     if (ctx.mode === "print") process.stdout.write(`${message}\n`);
     else if (ctx.mode === "json") pi.sendMessage({ customType: "pi-worktrunk-command", content: message, display: true, details: { level } });
     else ctx.ui.notify(message, level);
-  }
-  async function locationFor(item: WorktreeItem, signal?: AbortSignal): Promise<SessionLocation> {
-    if (!item.worktree?.path) throw new WorktrunkError("The target worktree has no path.");
-    return worktreeLocation(item, item.worktree.path, await readCommonDir(item.worktree.path, signal));
   }
   function continuationMessage(invocation: Invocation, execution: Execution) {
     const status = execution.result.code === 0 && !execution.result.killed
@@ -920,11 +888,9 @@ export default function extension(pi: ExtensionAPI) {
     ctx: ExtensionCommandContext,
     source: SessionLocation,
     target: SessionLocation,
-    trail: SessionLocation[],
-    kind: SessionTransitionKind,
     continuation?: ReturnType<typeof continuationMessage>,
   ) {
-    const destinationSession = createLinkedSession(ctx, source, target, trail, kind);
+    const destinationSession = createLinkedSession(ctx, source, target);
     const result = await ctx.switchSession(destinationSession, {
       withSession: async (nextCtx) => {
         if (continuation) {
@@ -948,14 +914,14 @@ export default function extension(pi: ExtensionAPI) {
       return { result: { code: 0 }, output: "", moved: false, canContinue: true };
     }
 
-    const trail = readSessionTrail(ctx);
+    const commonDir = await readCommonDir(ctx.cwd, ctx.signal);
+    const identity = commonDir ? repositoryIdentity(commonDir) : undefined;
     const before = await safeList(ctx.cwd, ctx.signal);
-    const sourceItem = itemForPath(before, ctx.cwd) ?? before.find((item) => item.worktree?.current);
-    const source = worktreeLocation(sourceItem, ctx.cwd, storedRepositoryIdentity?.commonDir);
+    const sourceItem = before.find((item) => item.worktree?.current);
+    const source: SessionLocation = { branch: sourceItem?.branch ?? null, path: ctx.cwd, commonDir };
     let args = invocation.args;
-    let selected: WorktreeItem | undefined;
     if (!modelOrigin && isBareCommand(invocation, "switch") && interactive && ctx.hasUI) {
-      selected = await chooseWorktree(ctx, "Select a worktree", before.filter((item) => item.worktree?.path));
+      const selected = await chooseWorktree(ctx, "Select a worktree", before.filter((item) => item.worktree?.path));
       if (!selected?.worktree?.path) {
         return { result: { code: 0 }, output: "", moved: false, canContinue: true };
       }
@@ -963,63 +929,41 @@ export default function extension(pi: ExtensionAPI) {
     }
 
     let result: WtResult;
-    try { result = await runWt(args, { cwd: ctx.cwd, signal: ctx.signal, cwdMode: "repository-read" }); }
+    try { result = await invoke(args, { cwd: ctx.cwd, signal: ctx.signal }); }
     catch (error) { result = { code: -1, stderr: error instanceof Error ? error.message : String(error) }; }
     const output = [result.stdout?.trimEnd(), result.stderr?.trimEnd()].filter(Boolean).join("\n");
     if (output) emit(ctx, output, result.code === 0 ? "info" : "error");
-    const base: Execution = { result, output, moved: false, canContinue: existsSync(ctx.cwd) };
+    const base: Execution = { result, output, moved: false, canContinue: false };
     const continuation = modelOrigin ? continuationMessage(invocation, base) : undefined;
 
-    const after = await safeList(ctx.cwd, ctx.signal);
-    if (!existsSync(ctx.cwd)) {
-      const recovery = recoveryTarget(trail, after);
-      if (!recovery.target?.worktree?.path) {
-        emit(ctx, "Pi's worktree was removed and no surviving worktree was found.", "error");
-        return { ...base, canContinue: false };
-      }
-      if (!interactive || !ctx.sessionManager.getSessionFile()) {
-        emit(ctx, `The current worktree was removed. Continue from ${recovery.target.worktree.path}.`, "warning");
-        return { ...base, canContinue: false };
-      }
-      try {
-        await activate(
-          ctx,
-          source,
-          await locationFor(recovery.target, ctx.signal),
-          recovery.trail,
-          "recovery",
-          continuation,
-        );
-        return { ...base, moved: true, canContinue: true };
-      } catch (error) {
-        emit(ctx, error instanceof Error ? error.message : String(error), "error");
-        return { ...base, canContinue: false };
-      }
-    }
-    if (result.code !== 0 || result.killed) return base;
-
-    let target = selected ?? uniqueCreatedTarget(before, after);
-    if (!target) {
-      const exact = exactSwitchTarget(invocation);
-      if (exact) target = resolveWorktree(after, exact);
-    }
-    if (!target?.worktree?.path) return base;
-    if (canonicalPath(target.worktree.path) === canonicalPath(ctx.cwd)) return base;
-    if (!interactive || !ctx.sessionManager.getSessionFile()) return base;
+    // Reconcile even after failure/cancellation: the command may already have moved.
+    // Use a fresh, bounded probe rather than the invocation's aborted signal.
     try {
-      await activate(
-        ctx,
-        source,
-        await locationFor(target, ctx.signal),
-        nextTrail(survivingTrail(trail, after), source),
-        "move",
-        continuation,
-      );
-      return { ...base, moved: true };
+      const directed = await directedDestination(result.directive, identity);
+      if (directed) {
+        if (canonicalPath(directed) === canonicalPath(ctx.cwd)) return { ...base, canContinue: true };
+        if (!interactive || !ctx.sessionManager.getSessionFile()) {
+          emit(ctx, `Worktrunk requested ${directed}. Continue Pi there; this session cannot move.`, "warning");
+          return { ...base, canContinue: false };
+        }
+        const items = await safeList(directed);
+        const target: SessionLocation = {
+          path: directed,
+          branch: items.find((item) => item.worktree?.current)?.branch ?? null,
+          commonDir,
+        };
+        await activate(ctx, source, target, continuation);
+        return { ...base, moved: true, canContinue: true };
+      }
     } catch (error) {
       emit(ctx, error instanceof Error ? error.message : String(error), "error");
-      return base;
+      return { ...base, canContinue: false };
     }
+    const currentCommonDir = await readCommonDir(ctx.cwd);
+    base.canContinue = Boolean(identity && currentCommonDir &&
+      sameRepositoryIdentity(identity, repositoryIdentity(currentCommonDir)));
+    if (!base.canContinue) emit(ctx, "Pi's working directory is no longer usable. No destination was requested; restart Pi in a surviving worktree.", "error");
+    return base;
   }
 
   pi.registerCommand("wt", {
@@ -1091,11 +1035,11 @@ export default function extension(pi: ExtensionAPI) {
     pi.registerTool({
       name: "worktrunk",
       label: "Worktrunk",
-      description: `Run Worktrunk commands using the command reference generated from the installed binary. The command's remaining arguments pass directly to wt without shell expansion. Commands that identify one destination move the Pi session there.${versionNotice}${referenceCatalog}${aliasCatalog}`,
+      description: `Run Worktrunk commands using the command reference generated from the installed binary. The command's remaining arguments pass directly to wt without shell expansion. Pi follows Worktrunk's directory-change directive, including from aliases and foreground hooks.${versionNotice}${referenceCatalog}${aliasCatalog}`,
       promptSnippet: "Run Worktrunk commands using the installed command, option, and example reference",
       promptGuidelines: [
         "Use worktrunk for Worktrunk commands. Select a command and its remaining arguments from the worktrunk reference and examples.",
-        "The worktrunk tool moves the session automatically when Worktrunk identifies one destination.",
+        "The worktrunk tool follows Worktrunk's requested directory automatically.",
       ],
       parameters: Type.Object({
         command: commandSchema,
@@ -1142,22 +1086,31 @@ export default function extension(pi: ExtensionAPI) {
         }
 
         if (ctx.mode === "print" || ctx.mode === "json") {
-          const placementCommand = nonInteractivePlacementCommand(invocation);
-          if (placementCommand) {
-            throw new WorktrunkError(`\`${placementCommand}\` requires TUI or RPC mode so Pi can preserve session placement.`);
-          }
-          const result = await runWt(args, { cwd: ctx.cwd, signal: _signal, cwdMode: "repository-read" });
+          const commonDir = await readCommonDir(ctx.cwd, _signal);
+          const identity = commonDir ? repositoryIdentity(commonDir) : undefined;
+          const result = await invoke(args, { cwd: ctx.cwd, signal: _signal });
           const output = boundedModelOutput(
             [result.stdout?.trimEnd(), result.stderr?.trimEnd()].filter(Boolean).join("\n"),
           );
           const details = { args, code: result.code };
-          if (!existsSync(ctx.cwd)) {
+          let stopReason: string | undefined;
+          try {
+            const destination = await directedDestination(result.directive, identity);
+            if (destination && canonicalPath(destination) !== canonicalPath(ctx.cwd)) {
+              stopReason = `Worktrunk requested ${destination}. Session movement requires TUI or RPC mode; restart Pi there.`;
+            } else {
+              const current = await readCommonDir(ctx.cwd);
+              if (!current || !sameRepositoryIdentity(identity, repositoryIdentity(current))) {
+                stopReason = `Pi's working directory no longer exists or is not the original Git worktree: ${ctx.cwd}. Restart Pi in a surviving worktree.`;
+              }
+            }
+          } catch (error) {
+            stopReason = error instanceof Error ? error.message : String(error);
+          }
+          if (stopReason) {
             ctx.abort();
             return {
-              content: [{
-                type: "text" as const,
-                text: [output, missingCwdMessage(ctx.cwd)].filter(Boolean).join("\n\n"),
-              }],
+              content: [{ type: "text" as const, text: [output, stopReason].filter(Boolean).join("\n\n") }],
               details,
               terminate: true,
             };
@@ -1208,7 +1161,6 @@ export default function extension(pi: ExtensionAPI) {
   registerTool();
 
   pi.on("session_start", async (_event, ctx) => {
-    await restoreRepositoryIdentity(ctx);
     await discoverCommandsAndAliases(ctx);
     registerTool();
     await tracker.markWaiting(ctx.cwd);
