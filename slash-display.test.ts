@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { Box } from "@earendil-works/pi-tui";
+import { Box, Text } from "@earendil-works/pi-tui";
 import extension from "./worktrunk.ts";
 
 const entryType = "pi-worktrunk-command-result";
@@ -104,6 +104,19 @@ for (const scenario of ["success", "empty", "failure", "killed", "throw", "move"
         content: [{ type: "text", text: entries[0].data.output }], details: { code: 0 },
       }, {}, theme, { isError: entries[0].data.isError }));
       assert.deepEqual(card.render(80), expected.render(80));
+      const collapsed = card.render(80).join("\n");
+      assert.match(collapsed, entries[0].data.isError ? /Failed/ : /Done/);
+      if (entries[0].data.output) {
+        assert.match(collapsed, /to expand/);
+        assert.ok(!collapsed.includes(entries[0].data.output.slice(0, 40)));
+        const expanded = renderers.get(entryType)(entries[0], { expanded: true }, theme);
+        const expandedExpected = new Box(1, 1);
+        expandedExpected.addChild(tools.get("worktrunk").renderCall({ command: "land" }, theme));
+        expandedExpected.addChild(new Text(entries[0].data.output, 0, 0));
+        assert.deepEqual(expanded.render(80), expandedExpected.render(80));
+      } else {
+        assert.doesNotMatch(collapsed, /to expand/);
+      }
       assert.ok(backgrounds.every((color) => color === (entries[0].data.isError ? "toolErrorBg" : "toolSuccessBg")));
       if (scenario === "move") {
         const destination = SessionManager.open(switched);

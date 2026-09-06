@@ -7,6 +7,7 @@ import { basename, resolve, join, isAbsolute } from "node:path";
 
 import {
   SessionManager,
+  keyText,
   type ExtensionAPI,
   type ExtensionCommandContext,
   type ExtensionContext,
@@ -776,13 +777,20 @@ function renderWorktrunkCall(args: string[], theme: Theme): Text {
   return new Text(text, 0, 0);
 }
 
+function renderWorktrunkOutput(output: string, expanded: boolean, isError: boolean, theme: Theme): Text {
+  if (expanded && output) return new Text(output, 0, 0);
+  let text = theme.fg(isError ? "error" : "success", isError ? "Failed" : "Done");
+  if (output) text += theme.fg("dim", ` (${keyText("app.tools.expand")} to expand)`);
+  return new Text(text, 0, 0);
+}
+
 export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedWt) {
-  pi.registerEntryRenderer<CommandDisplay>(COMMAND_ENTRY_TYPE, (entry, _options, theme) => {
+  pi.registerEntryRenderer<CommandDisplay>(COMMAND_ENTRY_TYPE, (entry, { expanded }, theme) => {
     if (!entry.data) return undefined;
     const { args, output, isError } = entry.data;
     const box = new Box(1, 1, (text) => theme.bg(isError ? "toolErrorBg" : "toolSuccessBg", text));
     box.addChild(renderWorktrunkCall(args, theme));
-    box.addChild(new Text(output, 0, 0));
+    box.addChild(renderWorktrunkOutput(output, expanded, isError, theme));
     return box;
   });
   const renderTransition: Parameters<ExtensionAPI["registerMessageRenderer"]>[1] =
@@ -1195,11 +1203,11 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
         const invocation = [args.command, ...(args.args ?? [])].filter((value): value is string => typeof value === "string");
         return renderWorktrunkCall(invocation, theme);
       },
-      renderResult(result, _options, _theme, context) {
+      renderResult(result, { expanded }, theme, context) {
         const details = result.details as { code?: unknown } | undefined;
         if (!context.isError && details?.code === undefined) return new Text("", 0, 0);
         const text = result.content.find((item) => item.type === "text")?.text ?? "";
-        return new Text(text, 0, 0);
+        return renderWorktrunkOutput(text, expanded, context.isError, theme);
       },
     });
   }
