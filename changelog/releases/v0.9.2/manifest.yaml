@@ -1,0 +1,8 @@
+created: 2026-09-06
+title: Collapsed Worktrunk output
+intro: >-
+  Worktrunk now keeps tool and command output collapsed until you expand it. Compact
+  status indicators mark successes and failures without flooding your transcript.
+source:
+  mode: sync-stable-queue
+  previous_stable: v0.9.1
