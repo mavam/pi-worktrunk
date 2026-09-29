@@ -62,6 +62,19 @@ Model calls run configured aliases and other Worktrunk commands without an
 additional Pi confirmation. Worktrunk continues to enforce its own safety checks
 and project-command approvals.
 
+### ✅ Project-command approvals
+
+Worktrunk asks once before it runs a repository's hooks or aliases, and asks
+again whenever they change. When a command needs this approval, Pi shows every
+unapproved project command in a confirmation dialog. Approving saves exactly
+those commands, as `wt config approvals add` would, and retries the command
+once. Aliases ask before they run, because a retry could repeat steps that
+already ran. Declining leaves the approvals unchanged and reports the failure.
+
+Without an interactive UI, such as in print or JSON mode, the command fails and
+lists the commands to approve in a terminal with `wt config approvals add`. The
+model cannot pass `-y`/`--yes` to skip approval.
+
 ## 🚦 Status markers
 
 The extension maps Pi lifecycle events to Worktrunk branch markers:
