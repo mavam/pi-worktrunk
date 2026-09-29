@@ -767,6 +767,29 @@ function isApprovalRetrySafe(invocation: Invocation): boolean {
 function quoteArgument(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
 }
+const WORKTREE_CHANGING_COMMANDS = new Set(["switch", "remove", "merge"]);
+const WORKTREE_CHANGING_STEPS = new Set(["promote", "prune", "relocate"]);
+/** Whether the command can switch to or remove worktrees (aliases may do either). */
+export function mayChangeWorktree(invocation: Invocation, isAlias: boolean, directive?: string): boolean {
+  if (directive) return true;
+  if (!invocation.command) return false;
+  if (isAlias) return true;
+  if (WORKTREE_CHANGING_COMMANDS.has(invocation.command)) return true;
+  return invocation.command === "step" &&
+    WORKTREE_CHANGING_STEPS.has(invocation.commandArgs.find((arg) => !arg.startsWith("-")) ?? "");
+}
+/** Name the alias steps and exit code for a failed alias run, or undefined for other commands. */
+export function aliasFailureSummary(invocation: Invocation, output: string, code: number | undefined): string | undefined {
+  const name = invocation.command;
+  if (!name) return undefined;
+  const header = output.match(new RegExp(`Running alias ${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}: (.+)`));
+  if (!header) return undefined;
+  const steps = header[1].split(",").map((step) => step.trim()).filter(Boolean);
+  const exit = code === undefined ? "" : ` with exit code ${code}`;
+  if (steps.length === 1) return `Alias \`${name}\` failed in step \`${steps[0]}\`${exit}.`;
+  return `Alias \`${name}\` failed${exit} in one of its steps (${steps.join(" -> ")}). ` +
+    "Steps run in order and stop at the first failure; Worktrunk does not report which one failed, so inspect the output above.";
+}
 function isBareCommand(invocation: Invocation, command: string): boolean {
   return invocation.command === command && invocation.commandArgs.length === 0;
 }
@@ -1038,8 +1061,13 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
         (approval
           ? "Worktrunk needs the user's approval for project commands. Do not pass `--yes` or otherwise bypass approval; tell the user what needs approval and how to proceed, then continue with work that does not depend on it."
           : status === "failed"
-          ? "Read the error and adapt your approach, then continue the original task. Do not blindly repeat the failed invocation."
-          : "Continue the original task in this worktree. Do not repeat the Worktrunk invocation."),
+          ? [
+            aliasFailureSummary(invocation, execution.output, execution.result.code),
+            "Read the error and adapt your approach, then continue the original task. Do not blindly repeat the failed invocation.",
+          ].filter(Boolean).join(" ")
+          : mayChangeWorktree(invocation, aliasNames.has(invocation.command ?? ""), execution.result.directive)
+          ? "Continue the original task in this worktree. Do not repeat the Worktrunk invocation."
+          : "The command did not change worktrees. Use the output above to continue the original task. Do not repeat the Worktrunk invocation."),
       display: false,
     } as const;
   }
@@ -1260,7 +1288,7 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
     pi.registerTool({
       name: "worktrunk",
       label: "Worktrunk",
-      description: `Run Worktrunk commands using the command reference generated from the installed binary. The command's remaining arguments pass directly to wt without shell expansion. Pi follows Worktrunk's directory-change directive, including from aliases and foreground hooks.${versionNotice}${referenceCatalog}${aliasCatalog}`,
+      description: `Run Worktrunk commands using the command reference generated from the installed binary. The command's remaining arguments pass directly to wt without shell expansion. Pi follows Worktrunk's directory-change directive, including from aliases and foreground hooks. Calls must be sequential: issue one Worktrunk call, wait for its result, then issue the next; a call made while another is still pending fails.${versionNotice}${referenceCatalog}${aliasCatalog}`,
       promptSnippet: "Run Worktrunk commands using the installed command, option, and example reference",
       promptGuidelines: [
         "Use worktrunk for Worktrunk commands. Select a command and its remaining arguments from the worktrunk reference and examples.",
@@ -1314,7 +1342,7 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
           placementInFlight = false;
         }
         if (placementInFlight) {
-          throw new WorktrunkError("Another model-triggered Worktrunk invocation is still pending.");
+          throw new WorktrunkError("Another model-triggered Worktrunk invocation is still pending. Worktrunk tool calls run sequentially: wait for the previous result, then call again.");
         }
 
         if (ctx.mode === "print" || ctx.mode === "json") {
@@ -1359,7 +1387,7 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
           if (result.code !== 0 || result.killed) {
             const failure = formatWtFailure(args, result, ctx.cwd);
             throw new WorktrunkError(boundedModelOutput(
-              [failure, approvalFailureDetails(failure, pending)].filter(Boolean).join("\n"),
+              [failure, aliasFailureSummary(invocation, failure, result.code), approvalFailureDetails(failure, pending)].filter(Boolean).join("\n"),
             ));
           }
           return {
