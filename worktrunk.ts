@@ -254,10 +254,54 @@ function canonicalPath(path: string): string {
   try { return realpathSync(path); } catch { return resolve(path); }
 }
 
+export type ProjectCommand = { phase?: string; name?: string; template: string; approved?: boolean };
+
+const APPROVAL_FAILURE = /needs approval|cannot prompt for approval/i;
+const APPROVAL_HINT = "Review and approve the project commands in a terminal with `wt config approvals add`, then retry.";
+// Built-in commands that Worktrunk verified to check approvals before any side
+// effect, so a failed approval leaves nothing to undo and one retry is safe.
+// Aliases and `step for-each` may act before a nested command stops for approval.
+const APPROVAL_RETRY_SAFE = new Set(["switch", "remove", "merge", "step", "hook", "list", "config"]);
+
+export function isApprovalFailure(output: string): boolean {
+  return APPROVAL_FAILURE.test(output);
+}
 function approvalHint(output: string): string {
-  return /needs approval|cannot prompt for approval/i.test(output)
-    ? "\nReview and approve the project commands in a terminal with `wt config approvals add`, then retry."
-    : "";
+  return isApprovalFailure(output) ? `\n${APPROVAL_HINT}` : "";
+}
+/** Unapproved entries of `wt config approvals list --format json`. */
+export function parsePendingApprovals(output: string): ProjectCommand[] | undefined {
+  let state: unknown;
+  try { state = JSON.parse(output); } catch { return undefined; }
+  const commands = (state as { commands?: unknown } | null)?.commands;
+  if (!Array.isArray(commands)) return undefined;
+  return commands.filter((command): command is ProjectCommand =>
+    Boolean(command) && typeof command.template === "string" && command.approved !== true);
+}
+export function formatProjectCommands(commands: readonly ProjectCommand[]): string {
+  return commands.map(({ phase, name, template }) => [
+    `○ ${[phase ?? "command", name].filter(Boolean).join(" ")}:`,
+    ...template.split("\n").map((line) => `  ${line}`),
+  ].join("\n")).join("\n");
+}
+function commandKeys(commands: readonly ProjectCommand[]): string {
+  return JSON.stringify(commands.map(({ phase, name, template }) => [phase, name, template]).sort());
+}
+/** The hint (unless already present) and the pending commands for an approval failure. */
+export function approvalFailureDetails(output: string, pending?: readonly ProjectCommand[]): string {
+  if (!isApprovalFailure(output)) return "";
+  return [
+    output.includes(APPROVAL_HINT) ? undefined : APPROVAL_HINT,
+    pending?.length ? `Unapproved project commands:\n${formatProjectCommands(pending)}` : undefined,
+  ].filter(Boolean).join("\n");
+}
+/** Model-originated flags that would skip the approval the user should see. */
+export function bypassesApproval(args: readonly string[]): boolean {
+  for (const arg of args) {
+    if (arg === "--") break;
+    if (arg === "--yes" || arg.startsWith("--yes=") || /^-[A-Za-z]*y[A-Za-z]*$/.test(arg)) return true;
+  }
+  return false;
 }
 function missingCwdMessage(cwd: string): string {
   return `Pi's working directory no longer exists: ${cwd}. Continue the session from an existing worktree or restart Pi there.`;
@@ -702,6 +746,24 @@ export function parseWtInvocation(input: string): Invocation {
     commandArgs: commandIndex === undefined ? [] : args.slice(commandIndex + 1),
   };
 }
+/** Global arguments that point `wt config approvals` at the invocation's project. */
+export function approvalScope(invocation: Invocation, cwd: string): string[] {
+  let directory = cwd;
+  const config: string[] = [];
+  const end = invocation.commandIndex ?? invocation.args.length;
+  for (let index = 0; index < end; index += 1) {
+    const value = invocation.args[index];
+    if (value === "-C" && index + 1 < end) directory = resolve(cwd, invocation.args[++index]);
+    else if (value.startsWith("-C") && value.length > 2) directory = resolve(cwd, value.slice(2));
+    else if ((value === "--config" || value === "--config-set") && index + 1 < end) config.push(value, invocation.args[++index]);
+    else if (value.startsWith("--config=") || value.startsWith("--config-set=")) config.push(value);
+  }
+  return ["-C", directory, ...config];
+}
+function isApprovalRetrySafe(invocation: Invocation): boolean {
+  if (!invocation.command || !APPROVAL_RETRY_SAFE.has(invocation.command)) return false;
+  return !(invocation.command === "step" && invocation.commandArgs.find((arg) => !arg.startsWith("-")) === "for-each");
+}
 function quoteArgument(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
 }
@@ -905,19 +967,77 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
       emit(ctx, output, isError ? "error" : "info");
     }
   }
+  async function pendingApprovals(scope: string[], cwd: string, signal?: AbortSignal): Promise<ProjectCommand[] | undefined> {
+    try {
+      const result = await runWt(
+        [...scope, "config", "approvals", "list", "--format", "json"],
+        { cwd, signal, timeout: HELP_PROBE_TIMEOUT_MS },
+      );
+      return result.code === 0 ? parsePendingApprovals(result.stdout ?? "") : undefined;
+    } catch { return undefined; }
+  }
+  async function describeApprovalFailure(output: string, scope: string[], cwd: string, signal?: AbortSignal): Promise<string> {
+    return isApprovalFailure(output)
+      ? approvalFailureDetails(output, await pendingApprovals(scope, cwd, signal))
+      : "";
+  }
+  type ApprovalOutcome = { approved: boolean; message: string };
+  /** Show the pending commands verbatim and store approval only for what the user saw. */
+  async function requestApproval(
+    ctx: ExtensionCommandContext,
+    args: readonly string[],
+    scope: string[],
+    known?: ProjectCommand[],
+  ): Promise<ApprovalOutcome> {
+    const pending = known ?? await pendingApprovals(scope, ctx.cwd, ctx.signal);
+    if (!pending?.length) {
+      return { approved: false, message: `Could not determine which project commands need approval.\n${APPROVAL_HINT}` };
+    }
+    const listing = formatProjectCommands(pending);
+    const confirmed = await ctx.ui.confirm(
+      "Approve Worktrunk project commands?",
+      `\`wt ${args.join(" ")}\` needs approval to run these project commands. ` +
+        `Approving saves them to Worktrunk's approvals for this project.\n\n${listing}`,
+      { signal: ctx.signal },
+    );
+    if (!confirmed) {
+      return { approved: false, message: `Approval declined; Worktrunk did not run these project commands:\n${listing}` };
+    }
+    // `approvals add --yes` approves whatever is pending when it runs. Refuse if
+    // that differs from what the user just reviewed.
+    const current = await pendingApprovals(scope, ctx.cwd, ctx.signal);
+    if (!current || commandKeys(current) !== commandKeys(pending)) {
+      return { approved: false, message: `The project commands changed while waiting for approval; nothing was approved.\n${APPROVAL_HINT}` };
+    }
+    let added: WtResult;
+    try {
+      added = await runWt([...scope, "config", "approvals", "add", "--yes"], { cwd: ctx.cwd, signal: ctx.signal });
+    } catch (error) {
+      added = { code: -1, stderr: error instanceof Error ? error.message : String(error) };
+    }
+    if (added.code !== 0) {
+      const detail = [added.stderr?.trim(), added.stdout?.trim()].filter(Boolean).join("\n");
+      return { approved: false, message: `Could not store approvals${detail ? `: ${detail}` : "."}\n${APPROVAL_HINT}` };
+    }
+    return { approved: true, message: `Approved project commands:\n${listing}` };
+  }
   function continuationMessage(invocation: Invocation, execution: Execution) {
     const status = execution.result.code === 0 && !execution.result.killed
       ? "completed successfully"
       : "failed";
+    const approval = status === "failed" && isApprovalFailure(execution.output);
+    const details = approval ? approvalFailureDetails(execution.output) : "";
     const output = execution.output
-      ? execution.output.slice(0, MAX_CONTINUATION_OUTPUT)
+      ? [execution.output.slice(0, MAX_CONTINUATION_OUTPUT), details].filter(Boolean).join("\n")
       : "(no output)";
     return {
       customType: CONTINUATION_MESSAGE_TYPE,
       content:
         `Worktrunk invocation \`wt ${invocation.args.join(" ")}\` ${status} ` +
         `(exit ${execution.result.code}).\n\n${output}\n\n` +
-        (status === "failed"
+        (approval
+          ? "Worktrunk needs the user's approval for project commands. Do not pass `--yes` or otherwise bypass approval; tell the user what needs approval and how to proceed, then continue with work that does not depend on it."
+          : status === "failed"
           ? "Read the error and adapt your approach, then continue the original task. Do not blindly repeat the failed invocation."
           : "Continue the original task in this worktree. Do not repeat the Worktrunk invocation."),
       display: false,
@@ -967,10 +1087,56 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
       args = ["switch", selected.worktree.path];
     }
 
-    let result: WtResult;
-    try { result = await invoke(args, { cwd: ctx.cwd, signal: ctx.signal }); }
-    catch (error) { result = { code: -1, stderr: error instanceof Error ? error.message : String(error) }; }
-    const output = [result.stdout?.trimEnd(), result.stderr?.trimEnd()].filter(Boolean).join("\n");
+    const scope = approvalScope(invocation, ctx.cwd);
+    const canPrompt = interactive && ctx.hasUI;
+    const retrySafe = isApprovalRetrySafe(invocation);
+    const notes: string[] = [];
+    const command = invocation.command;
+    const preflight = command !== undefined && !retrySafe &&
+      (aliasNames.has(command) || !commandNames.has(command) || command === "step");
+    if (canPrompt && preflight) {
+      // Aliases may run steps before a nested command stops for approval, so
+      // ask before running rather than retrying afterwards.
+      const pending = await pendingApprovals(scope, ctx.cwd, ctx.signal);
+      if (pending?.length) {
+        const outcome = await requestApproval(ctx, args, scope, pending);
+        if (!outcome.approved) {
+          const output = `wt ${args.join(" ")} did not run. ${outcome.message}`;
+          displayCommand(ctx, args, output, true, modelOrigin);
+          return { result: { code: 1 }, output, moved: false, canContinue: true };
+        }
+        notes.push(outcome.message);
+      }
+    }
+
+    const run = async (): Promise<WtResult> => {
+      try { return await invoke(args, { cwd: ctx.cwd, signal: ctx.signal }); }
+      catch (error) { return { code: -1, stderr: error instanceof Error ? error.message : String(error) }; }
+    };
+    const combine = (value: WtResult) => [value.stdout?.trimEnd(), value.stderr?.trimEnd()].filter(Boolean).join("\n");
+    const approvalFailed = (value: WtResult, text: string) => value.code !== 0 && !value.killed && isApprovalFailure(text);
+    let result = await run();
+    let output = combine(result);
+    let explained = false;
+    if (approvalFailed(result, output) && canPrompt) {
+      explained = true;
+      const outcome = await requestApproval(ctx, args, scope);
+      if (outcome.approved && retrySafe) {
+        // Worktrunk checks approvals before acting, so nothing ran; retry once.
+        notes.push(outcome.message);
+        result = await run();
+        output = combine(result);
+        explained = false;
+      } else if (outcome.approved) {
+        output = [output, outcome.message, `Did not rerun \`wt ${args.join(" ")}\` automatically because earlier steps may already have run. Rerun it when that is safe.`].join("\n\n");
+      } else {
+        output = [output, outcome.message].join("\n\n");
+      }
+    }
+    if (!explained && approvalFailed(result, output)) {
+      output = [output, await describeApprovalFailure(output, scope, ctx.cwd, ctx.signal)].filter(Boolean).join("\n");
+    }
+    output = [...notes, output].filter(Boolean).join("\n\n");
     displayCommand(ctx, args, output, result.code !== 0 || Boolean(result.killed), modelOrigin);
     const base: Execution = { result, output, moved: false, canContinue: false };
     const continuation = modelOrigin ? continuationMessage(invocation, base) : undefined;
@@ -1019,6 +1185,7 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
     async handler(input, ctx) {
       let modelOrigin = false;
       let modelInvocation: Invocation | undefined;
+      let scopeInvocation: Invocation | undefined;
       try {
         const received = parseWtInvocation(input);
         const marker = received.args.at(-1);
@@ -1027,6 +1194,7 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
           : undefined;
         const args = nonce ? received.args.slice(0, -1) : received.args;
         const invocation = parseWtInvocation(args.map(quoteArgument).join(" "));
+        scopeInvocation = invocation;
         const key = JSON.stringify(invocation.args);
         if (
           nonce &&
@@ -1055,7 +1223,11 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
           pi.sendMessage(continuationMessage(invocation, execution), { triggerTurn: true });
         }
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
+        let message = error instanceof Error ? error.message : String(error);
+        if (isApprovalFailure(message)) {
+          const scope = approvalScope(scopeInvocation ?? parseWtInvocation(""), ctx.cwd);
+          message = [message, await describeApprovalFailure(message, scope, ctx.cwd)].filter(Boolean).join("\n");
+        }
         emit(ctx, message, "error");
         if (modelInvocation && await readCommonDir(ctx.cwd)) {
           pi.sendMessage(continuationMessage(modelInvocation, {
@@ -1093,6 +1265,7 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
       promptGuidelines: [
         "Use worktrunk for Worktrunk commands. Select a command and its remaining arguments from the worktrunk reference and examples.",
         "The worktrunk tool follows Worktrunk's requested directory automatically.",
+        "Never pass -y/--yes to worktrunk; approving project commands is the user's decision, and Pi asks the user when Worktrunk needs approval.",
       ],
       parameters: Type.Object({
         command: commandSchema,
@@ -1130,6 +1303,12 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
         if (isBareCommand(invocation, "switch")) {
           throw new WorktrunkError("The worktrunk tool requires an explicit target for `wt switch`.");
         }
+        if (bypassesApproval(args)) {
+          throw new WorktrunkError(
+            "The worktrunk tool does not accept `-y`/`--yes`: it would skip Worktrunk's approval of project commands. " +
+            "Run the command without it. When Worktrunk needs approval, Pi asks the user in interactive sessions; otherwise the user must approve in a terminal with `wt config approvals add`.",
+          );
+        }
         if (pendingContinuation && pendingContinuation.expiresAt <= Date.now()) {
           pendingContinuation = undefined;
           placementInFlight = false;
@@ -1146,6 +1325,10 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
             [result.stdout?.trimEnd(), result.stderr?.trimEnd()].filter(Boolean).join("\n"),
           );
           const details = { args, code: result.code };
+          const pending = result.code !== 0 && !result.killed && isApprovalFailure(output)
+            ? await pendingApprovals(approvalScope(invocation, ctx.cwd), ctx.cwd)
+            : undefined;
+          const approval = approvalFailureDetails(output, pending);
           let stopReason: string | undefined;
           try {
             const destination = await directedDestination(result.directive, identity);
@@ -1161,20 +1344,23 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
             const message = error instanceof Error ? error.message : String(error);
             const current = await readCommonDir(ctx.cwd);
             if (current && sameRepositoryIdentity(identity, repositoryIdentity(current))) {
-              throw new WorktrunkError(boundedModelOutput([output, message].filter(Boolean).join("\n\n")));
+              throw new WorktrunkError(boundedModelOutput([output, approval, message].filter(Boolean).join("\n\n")));
             }
             stopReason = message;
           }
           if (stopReason) {
             ctx.abort();
             return {
-              content: [{ type: "text" as const, text: [output, stopReason].filter(Boolean).join("\n\n") }],
+              content: [{ type: "text" as const, text: [output, approval, stopReason].filter(Boolean).join("\n\n") }],
               details,
               terminate: true,
             };
           }
           if (result.code !== 0 || result.killed) {
-            throw new WorktrunkError(boundedModelOutput(formatWtFailure(args, result, ctx.cwd)));
+            const failure = formatWtFailure(args, result, ctx.cwd);
+            throw new WorktrunkError(boundedModelOutput(
+              [failure, approvalFailureDetails(failure, pending)].filter(Boolean).join("\n"),
+            ));
           }
           return {
             content: [{ type: "text" as const, text: output || `wt ${args.join(" ")} completed successfully.` }],
