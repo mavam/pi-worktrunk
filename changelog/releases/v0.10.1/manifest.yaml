@@ -1,0 +1,9 @@
+created: 2026-09-29
+title: Clearer Worktrunk tool results
+intro: >-
+  This release makes Worktrunk tool results clearer for the model. It documents sequential
+  calls, limits the worktree continuation hint to commands that change worktrees,
+  and reports alias steps and exit codes on failure.
+source:
+  mode: sync-stable-queue
+  previous_stable: v0.10.0
