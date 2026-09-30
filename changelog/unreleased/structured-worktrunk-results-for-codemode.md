@@ -3,6 +3,8 @@ title: Structured Worktrunk results for codemode
 type: feature
 authors:
   - mavam
+prs:
+  - 23
 created: 2026-09-30T07:21:51.225291Z
 ---
 
