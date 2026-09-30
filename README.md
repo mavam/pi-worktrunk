@@ -135,7 +135,7 @@ the reported directory rather than continue the script.
 
 ## 🧰 Requirements
 
-- Use current Pi with codemode and structured tool results.
+- Use Pi 0.99.1 or later. Earlier versions are not supported.
 - Install current [`wt`](https://worktrunk.dev/) with the
   `WORKTRUNK_DIRECTIVE_CD_FILE` protocol and make it available on your `PATH`.
 - Use TUI or RPC mode for session movement. In print or JSON mode, a directory

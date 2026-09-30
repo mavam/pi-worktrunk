@@ -163,7 +163,6 @@ type Execution = {
 type PendingContinuation = { key: string; nonce: string; expiresAt: number };
 
 const SESSION_TRANSITION_MESSAGE = "pi-worktrunk";
-const LEGACY_SESSION_TRANSITION_MESSAGE = "pi-worktrunk-session-transition";
 const CONTINUATION_MESSAGE_TYPE = "pi-worktrunk-continuation";
 const MAX_CONTINUATION_OUTPUT = 50_000;
 const CONTINUATION_ARG_PREFIX = "__pi_worktrunk_continuation=";
@@ -944,8 +943,7 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
     }
     return new Text(text, outputPad, 0);
   };
-  pi.registerMessageRenderer?.(SESSION_TRANSITION_MESSAGE, renderTransition);
-  pi.registerMessageRenderer?.(LEGACY_SESSION_TRANSITION_MESSAGE, renderTransition);
+  pi.registerMessageRenderer(SESSION_TRANSITION_MESSAGE, renderTransition);
 
   const execWt: RunWt = (args, options) => pi.exec("wt", args, options);
   let aliases: WorktrunkAlias[] = [];
@@ -1355,29 +1353,6 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
           description: "Arguments after the Worktrunk command, in CLI order and without shell expansion.",
         })),
       }, { additionalProperties: false }),
-      prepareArguments(value): { command: string; args?: string[] } {
-        const input = value as { command?: unknown; args?: unknown } | undefined;
-        if (typeof input?.command === "string") {
-          return {
-            command: input.command,
-            ...(Array.isArray(input.args) ? { args: input.args.filter((arg): arg is string => typeof arg === "string") } : {}),
-          };
-        }
-        if (Array.isArray(input?.args) && input.args.every((arg) => typeof arg === "string")) {
-          const legacyArgs = input.args as string[];
-          const invocation = parseWtInvocation(legacyArgs.map(quoteArgument).join(" "));
-          if (invocation.command !== undefined && invocation.commandIndex !== undefined) {
-            return {
-              command: invocation.command,
-              args: [
-                ...legacyArgs.slice(0, invocation.commandIndex),
-                ...legacyArgs.slice(invocation.commandIndex + 1),
-              ],
-            };
-          }
-        }
-        return value as { command: string; args?: string[] };
-      },
       outputSchema: WorktrunkOutput,
       executionMode: "sequential",
       async execute(_id, params, _signal, _update, ctx) {

@@ -13,6 +13,7 @@ function toolRenderer() {
   extension({
     on() {},
     registerCommand() {},
+    registerMessageRenderer() {},
     registerEntryRenderer() {},
     registerTool(definition: any) { tool = definition; },
   } as any);

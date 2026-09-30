@@ -281,12 +281,7 @@ test("tool registers synchronously before repository-specific discovery", async 
   assert.match(tool.description, /Example: \{"command":"deploy","args":\[\]\}/);
   assert.match(tool.promptSnippet, /installed command, option, and example reference/);
   assert.ok(tool.promptGuidelines.some((guideline: string) => guideline.includes("reference and examples")));
-  assert.deepEqual(tool.prepareArguments({ args: ["switch", "--create", "fix/parser"] }), {
-    command: "switch", args: ["--create", "fix/parser"],
-  });
-  assert.deepEqual(tool.prepareArguments({ args: ["-v", "land", "two words"] }), {
-    command: "land", args: ["-v", "two words"],
-  });
+  assert.equal(tool.prepareArguments, undefined);
   assert.deepEqual(commands.get("wt").getArgumentCompletions("sw"), [
     { value: "switch", label: "switch" },
   ]);
@@ -750,7 +745,7 @@ test("transition renderer keeps move and recovery variants compact", () => {
   const renderers = new Map<string, any>();
   extension(baseApi({ handlers, commands, tools, renderer: renderers, async exec() { return { code: 0, stdout: "" }; } }));
   const renderer = renderers.get("pi-worktrunk");
-  assert.ok(renderers.has("pi-worktrunk-session-transition"));
+  assert.deepEqual([...renderers.keys()], ["pi-worktrunk"]);
   const theme = {
     fg(color: string, text: string) { return `<${color}>${text}</${color}>`; },
     bold(text: string) { return `<bold>${text}</bold>`; },
