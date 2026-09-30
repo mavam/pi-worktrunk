@@ -61,17 +61,16 @@ async function continuationFor(args: string[], stdout: string, code = 0, stderr 
       async switchSession() { return { cancelled: true }; },
     };
     const [command, ...rest] = args;
-    await tools.get("worktrunk").execute("call", { command, args: rest }, undefined, undefined, ctx);
+    const result = await tools.get("worktrunk").execute("call", { command, args: rest }, undefined, undefined, ctx);
+    if (!sent.length) return result.content[0].text as string;
     await commands.get("wt").handler(sent[0].slice(4), ctx);
     return messages[0].content as string;
   } finally { await rm(root, { recursive: true, force: true }); }
 }
 
-test("read-only success does not claim a worktree continuation", async () => {
+test("read-only success returns output without a worktree continuation", async () => {
   const content = await continuationFor(["config", "alias", "show", "land"], "template");
-  assert.match(content, /completed successfully/);
-  assert.doesNotMatch(content, /in this worktree/);
-  assert.match(content, /did not change worktrees/);
+  assert.equal(content, "template");
 });
 
 test("failed alias continuation names the steps and exit code", async () => {
@@ -94,6 +93,6 @@ test("tool description and pending error say calls must be sequential", async ()
   const tool = tools.get("worktrunk");
   assert.match(tool.description, /Calls must be sequential/);
   const ctx = { cwd: process.cwd(), hasUI: false, ui: {} };
-  await tool.execute("a", { command: "list" }, undefined, undefined, ctx);
+  await tool.execute("a", { command: "land" }, undefined, undefined, ctx);
   await assert.rejects(tool.execute("b", { command: "list" }, undefined, undefined, ctx), /run sequentially/);
 });

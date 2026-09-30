@@ -594,19 +594,14 @@ test("model list bypasses the picker and receives Worktrunk output", async () =>
     const manager = SessionManager.create(source, join(root, "sessions"));
     manager.appendSessionInfo("test");
     await handlers.get("session_start")({}, { cwd: source, sessionManager: manager });
-    await tools.get("worktrunk").execute("call", { command: "list" }, undefined, undefined, {
-      cwd: source, hasUI: true, ui: {},
+    const result = await tools.get("worktrunk").execute("call", { command: "list" }, undefined, undefined, {
+      cwd: source, mode: "tui", hasUI: true,
+      ui: { async select() { throw new Error("model list must not open a picker"); } },
     });
-    await commands.get("wt").handler(sent[0].text.slice(4), {
-      cwd: source, mode: "tui", hasUI: true, sessionManager: manager,
-      async waitForIdle() {},
-      ui: {
-        notify() {},
-        async select() { throw new Error("model list must not open a picker"); },
-      },
-    });
-    assert.match(messages.at(-1)?.message.content ?? "", /completed successfully.*main worktree/s);
-    assert.equal(messages.at(-1)?.options.triggerTurn, true);
+    assert.equal(result.structuredContent.status, "completed");
+    assert.equal(result.structuredContent.output, "main worktree");
+    assert.deepEqual(sent, []);
+    assert.deepEqual(messages, []);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

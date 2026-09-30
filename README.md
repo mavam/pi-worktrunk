@@ -102,8 +102,40 @@ additional Pi confirmation. Commands that move to another worktree stop the old
 model turn, switch to a linked session, report Worktrunk's result, and resume the
 task there.
 
+### 🧑‍💻 Codemode
+
+You can call `tools.worktrunk()` from codemode while keeping the tool available
+for direct calls. Inspection commands such as `list`, `config show`, `hook show`,
+and `step diff` return immediately, so you can inspect their results and chain
+another call:
+
+```js
+const result = await tools.worktrunk({ command: "list", args: ["--format=json"] });
+text(result.status === "completed" ? result.data : result.output);
+```
+
+Results include `status`, `args`, `cwd`, `output`, and `truncated`. Executed
+commands also include `code`; valid stdout JSON within the output limit is
+available as `data`. Command failures return `status: "failed"` with diagnostics.
+Invalid arguments, blocked calls, and overlapping calls still throw.
+
+In TUI or RPC mode, mutations, hooks, aliases, and commands not recognized as
+inspection commands return `status: "queued"`. They haven't run yet: Pi runs
+them after the turn ends, handles approvals and session movement, then returns
+the result in a continuation. End your script immediately after queuing one:
+
+```js
+return await tools.worktrunk({ command: "switch", args: ["--create", "fix/parser"] });
+```
+
+Don't run Worktrunk calls in parallel. While a command is queued, Pi blocks
+further tool calls to prevent work in the old workspace. In print or JSON mode,
+commands execute immediately; `status: "stopped"` means you must restart Pi in
+the reported directory rather than continue the script.
+
 ## 🧰 Requirements
 
+- Use current Pi with codemode and structured tool results.
 - Install current [`wt`](https://worktrunk.dev/) with the
   `WORKTRUNK_DIRECTIVE_CD_FILE` protocol and make it available on your `PATH`.
 - Use TUI or RPC mode for session movement. In print or JSON mode, a directory
