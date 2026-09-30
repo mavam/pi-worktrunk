@@ -12,6 +12,7 @@ import extension, {
   parseWtInvocation,
   type ProjectCommand,
 } from "./worktrunk.ts";
+import { recordWidgets } from "./widget-recorder.ts";
 
 const SERVERS: ProjectCommand = {
   phase: "pre-remove",
@@ -37,6 +38,8 @@ type Harness = {
   approvalsAdded: string[][];
   prompts: { title: string; message: string }[];
   messages: any[];
+  /** Progress widget changes, with `prompt` marking each approval dialog. */
+  progress: string[];
   /** Run a model-originated invocation through the queued slash-command path. */
   model(command: string, args?: string[]): Promise<void>;
   /** Run a user-typed `/wt` command. */
@@ -75,6 +78,7 @@ async function withHarness(
       approvalsAdded: [],
       prompts: [],
       messages: [],
+      progress: [],
       async model(command, args = []) {
         await tools.get("worktrunk").execute("call", { command, args }, undefined, undefined, ctx);
         await commands.get("wt").handler(sent.shift()!.slice(4), ctx);
@@ -113,8 +117,10 @@ async function withHarness(
       sessionManager: manager,
       ui: {
         notify() {},
+        ...recordWidgets(harness.progress),
         async confirm(title: string, message: string) {
           harness.prompts.push({ title, message });
+          harness.progress.push("prompt");
           return options.confirm ?? true;
         },
       },
@@ -146,6 +152,15 @@ for (const mode of ["tui", "rpc"] as const) {
       assert.match(content, /completed successfully \(exit 0\)/);
       assert.match(content, /Approved project commands:/);
       assert.match(content, /✓ done/);
+      // Only the TUI shows a spinner. It yields to the dialog, then resumes for the approval and the retry.
+      assert.deepEqual(harness.progress, mode === "tui" ? [
+        "show: Running wt switch --create topic",
+        "hide",
+        "prompt",
+        "show: Approving project commands",
+        "show: Running wt switch --create topic",
+        "hide",
+      ] : ["prompt"]);
     });
   });
 
@@ -161,6 +176,11 @@ for (const mode of ["tui", "rpc"] as const) {
       assert.match(content, /devenv revoke/);
       assert.match(content, /wt config approvals add/);
       assert.match(content, /Do not pass `--yes`/);
+      assert.deepEqual(harness.progress, mode === "tui" ? [
+        "show: Running wt remove topic",
+        "hide",
+        "prompt",
+      ] : ["prompt"]);
     });
   });
 }

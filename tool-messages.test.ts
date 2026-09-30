@@ -57,7 +57,7 @@ async function continuationFor(args: string[], stdout: string, code = 0, stderr 
     } as any, async () => ({ code, stdout, stderr }));
     const ctx = {
       mode: "tui", cwd: source, hasUI: true, sessionManager: manager,
-      ui: { notify() {} }, async waitForIdle() {},
+      ui: { notify() {}, setWidget() {} }, async waitForIdle() {},
       async switchSession() { return { cancelled: true }; },
     };
     const [command, ...rest] = args;

@@ -6,6 +6,7 @@ import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import extension from "./worktrunk.ts";
+import { recordWidgets } from "./widget-recorder.ts";
 
 const entryType = "pi-worktrunk-command-result";
 
@@ -27,6 +28,7 @@ for (const scenario of ["success", "empty", "failure", "killed", "throw", "move"
       const messages: any[] = [];
       const sent: string[] = [];
       const invocations: string[][] = [];
+      const progress: string[] = [];
       let switched = "";
       extension({
         on() {},
@@ -62,8 +64,8 @@ for (const scenario of ["success", "empty", "failure", "killed", "throw", "move"
         mode: scenario === "json" ? "json" : "tui", cwd: source, hasUI: scenario !== "json",
         sessionManager: manager,
         async waitForIdle() {},
-        async switchSession(path: string) { switched = path; return { cancelled: false }; },
-        ui: { notify(text: string) { notifications.push(text); } },
+        async switchSession(path: string) { switched = path; progress.push("switch"); return { cancelled: false }; },
+        ui: { notify(text: string) { notifications.push(text); }, ...recordWidgets(progress) },
       };
       let input = "land";
       if (scenario === "model") {
@@ -72,6 +74,10 @@ for (const scenario of ["success", "empty", "failure", "killed", "throw", "move"
       }
       await commands.get("wt").handler(input, ctx);
       assert.deepEqual(invocations, [["land"]]);
+      // The spinner is TUI-only and gone before the session switch invalidates the context.
+      assert.deepEqual(progress, scenario === "json" ? [] : scenario === "move"
+        ? ["show: Running wt land", "hide", "show: Moving session", "hide", "switch"]
+        : ["show: Running wt land", "hide"]);
       if (scenario === "model" || scenario === "json") {
         assert.equal(entries.length, 0);
         if (scenario === "model") assert.deepEqual(notifications, ["Fast-forward"]);
