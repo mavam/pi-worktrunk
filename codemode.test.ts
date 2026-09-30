@@ -22,7 +22,7 @@ async function withTool(invoke: Invoke, run: (h: any) => Promise<void>) {
     let tool: any;
     const handlers = new Map<string, any>();
     const sent: string[] = [];
-    extension({
+    const api: any = {
       on(name: string, handler: any) { handlers.set(name, handler); },
       registerCommand() {}, registerMessageRenderer() {}, registerEntryRenderer() {},
       registerTool(definition: any) { tool = definition; },
@@ -31,9 +31,10 @@ async function withTool(invoke: Invoke, run: (h: any) => Promise<void>) {
         if (program === "git") return { code: 0, stdout: args.includes("--is-inside-work-tree") ? "true\n" : common };
         return { code: 1, stdout: "" };
       },
-    } as any, invoke);
+    };
+    extension(api, invoke);
     const ctx = { mode: "tui", cwd: root, hasUI: false, abort() {} };
-    await run({ tool, ctx, sent, handlers });
+    await run({ tool, ctx, sent, handlers, api });
   } finally { await rm(root, { recursive: true, force: true }); }
 }
 
@@ -62,6 +63,21 @@ for (const mode of ["tui", "rpc", "print", "json"]) {
     });
   });
 }
+
+test("scalar stdout stays in output and is not exposed as data", async () => {
+  for (const stdout of ["42", "true", "null", '"text"']) {
+    await withTool(async () => ({ code: 0, stdout }), async ({ tool, ctx }) => {
+      const result = await tool.execute("call", { command: "config", args: ["state", "vars", "get", "x"] }, undefined, undefined, ctx);
+      assert.equal(result.structuredContent.output, stdout);
+      assert.equal("data" in result.structuredContent, false, stdout);
+      assert.equal(Check(tool.outputSchema, result.structuredContent), true);
+    });
+  }
+  await withTool(async () => ({ code: 0, stdout: "[1,2]" }), async ({ tool, ctx }) => {
+    const result = await tool.execute("call", { command: "list" }, undefined, undefined, ctx);
+    assert.deepEqual(result.structuredContent.data, [1, 2]);
+  });
+});
 
 test("failure results retain machine-readable diagnostics", async () => {
   await withTool(async () => ({ code: 7, stdout: '{"reason":"conflict"}', stderr: "failed" }), async ({ tool, ctx }) => {
@@ -152,9 +168,10 @@ test("stopped results identify unusable workspaces and conform to the schema", a
   });
 });
 
-test("queued commands are explicit handoffs and block dependent tools", async () => {
+test("queued commands are explicit handoffs and block dependent tools until the run ends", async () => {
   let calls = 0;
   await withTool(async () => { calls++; return { code: 0 }; }, async ({ tool, ctx, sent, handlers }) => {
+    assert.equal(handlers.get("tool_call")({ toolName: "bash" }, ctx), undefined, "nothing queued yet");
     const result = await tool.execute("call", { command: "switch", args: ["main"] }, undefined, undefined, ctx);
     assert.equal(result.structuredContent.status, "queued");
     assert.equal(result.structuredContent.code, undefined);
@@ -166,6 +183,26 @@ test("queued commands are explicit handoffs and block dependent tools", async ()
     assert.equal(blocked.block, true);
     assert.equal(blocked.terminate, true);
     assert.match(blocked.reason, /has not run yet/);
+    // The block ends with the run, even if the queued follow-up never arrives.
+    await handlers.get("agent_end")({}, { cwd: ctx.cwd });
+    assert.equal(handlers.get("tool_call")({ toolName: "bash" }, ctx), undefined);
+  });
+});
+
+test("session shutdown releases the handoff block", async () => {
+  await withTool(async () => ({ code: 0 }), async ({ tool, ctx, handlers }) => {
+    await tool.execute("call", { command: "switch", args: ["main"] }, undefined, undefined, ctx);
+    assert.equal(handlers.get("tool_call")({ toolName: "bash" }, ctx).block, true);
+    await handlers.get("session_shutdown")({}, { cwd: ctx.cwd });
+    assert.equal(handlers.get("tool_call")({ toolName: "bash" }, ctx), undefined);
+  });
+});
+
+test("a failed handoff does not leave tools blocked", async () => {
+  await withTool(async () => ({ code: 0 }), async ({ tool, ctx, handlers, api }) => {
+    api.sendUserMessage = () => { throw new Error("cannot queue"); };
+    await assert.rejects(tool.execute("call", { command: "switch", args: ["main"] }, undefined, undefined, ctx), /cannot queue/);
+    assert.equal(handlers.get("tool_call")({ toolName: "bash" }, ctx), undefined);
   });
 });
 

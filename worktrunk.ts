@@ -816,7 +816,7 @@ const WorktrunkOutput = Type.Object({
   code: Type.Optional(Type.Integer({ description: "Worktrunk exit code; absent for queued commands." })),
   output: Type.String({ description: "Bounded command output, including failure and continuation guidance." }),
   truncated: Type.Boolean(),
-  data: Type.Optional(Type.Unknown({ description: "Parsed stdout JSON, when valid and within the output limit." })),
+  data: Type.Optional(Type.Unknown({ description: "Parsed stdout JSON object or array, when valid and within the output limit." })),
 }, { additionalProperties: false });
 
 function toolReply(
@@ -824,9 +824,13 @@ function toolReply(
   args: string[], cwd: string, text: string, result?: WtResult,
 ): AgentToolResult<{ args: string[]; code?: number }> {
   const output = boundedModelOutput(text);
-  let data;
+  let data: any;
   if (result?.stdout && result.stdout.length <= MAX_CONTINUATION_OUTPUT) {
-    try { data = JSON.parse(result.stdout); } catch { /* Plain text is valid output too. */ }
+    try {
+      const parsed = JSON.parse(result.stdout);
+      // Scalars such as `42` or `true` are plain values; `output` already carries them.
+      if (typeof parsed === "object" && parsed !== null) data = parsed;
+    } catch { /* Plain text is valid output too. */ }
   }
   return {
     content: [{ type: "text", text: output }],
@@ -953,6 +957,8 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
   let pendingContinuation: PendingContinuation | undefined;
   let placementInFlight = false;
   let invocationInFlight = false;
+  // Set while a queued command waits for this agent run to end.
+  let blockToolCalls = false;
   const commandNames = new Set<string>();
   const aliasNames = new Set<string>();
 
@@ -1440,6 +1446,7 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
             placementInFlight = false;
             throw error;
           }
+          blockToolCalls = true;
           return toolReply("queued", args, ctx.cwd, `Queued wt ${args.join(" ")}. Worktrunk will run after this turn, and the result will be returned before work continues. End this script now; do not run dependent tools yet.`);
         } finally {
           invocationInFlight = false;
@@ -1463,10 +1470,11 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
   registerTool();
 
   // Nested tools do not propagate terminate to their caller. Prevent a script
-  // (or a subsequent model tool call) from using the old workspace while a
-  // command is queued for the idle/session-replacement boundary.
+  // (or a subsequent model tool call) from using the old workspace after a
+  // command is queued. The block ends with the agent run, before the queued
+  // command executes, so it cannot outlive a dropped follow-up.
   pi.on("tool_call", () => {
-    if (placementInFlight && pendingContinuation && pendingContinuation.expiresAt > Date.now()) {
+    if (blockToolCalls) {
       return {
         block: true,
         reason: "A Worktrunk command is queued and has not run yet. End this script/turn and wait for its continuation before calling more tools.",
@@ -1481,6 +1489,12 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
     await tracker.markWaiting(ctx.cwd);
   });
   pi.on("agent_start", (_event, ctx) => tracker.markWorking(ctx.cwd));
-  pi.on("agent_end", (_event, ctx) => tracker.markWaiting(ctx.cwd));
-  pi.on("session_shutdown", (_event, ctx) => tracker.clear(ctx.cwd));
+  pi.on("agent_end", (_event, ctx) => {
+    blockToolCalls = false;
+    return tracker.markWaiting(ctx.cwd);
+  });
+  pi.on("session_shutdown", (_event, ctx) => {
+    blockToolCalls = false;
+    return tracker.clear(ctx.cwd);
+  });
 }

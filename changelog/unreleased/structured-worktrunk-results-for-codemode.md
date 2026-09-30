@@ -12,7 +12,8 @@ You can now use Worktrunk results directly in codemode scripts. Inspection comma
 
 ```js
 const result = await tools.worktrunk({ command: "list", args: ["--format=json"] });
-text(result.status === "completed" ? result.data : result.output);
+if (result.status !== "completed") throw new Error(result.output);
+text(result.data ?? result.output);
 ```
 
-Commands that need approvals or may change worktrees still run after the turn in TUI and RPC mode. They return `status: "queued"`, so end your script and wait for the continuation before doing dependent work. Pi blocks further tool calls during this handoff to prevent work in the old workspace. Command failures retain structured diagnostics, and overlapping Worktrunk calls are rejected before a second command starts.
+Commands that need approvals or may change worktrees still run after the turn in TUI and RPC mode. They return `status: "queued"`, so end your script and wait for the continuation before doing dependent work. Pi blocks further tool calls for the rest of the turn to prevent work in the old workspace. Command failures retain structured diagnostics, and overlapping Worktrunk calls are rejected before a second command starts.

@@ -111,13 +111,15 @@ another call:
 
 ```js
 const result = await tools.worktrunk({ command: "list", args: ["--format=json"] });
-text(result.status === "completed" ? result.data : result.output);
+if (result.status !== "completed") throw new Error(result.output);
+text(result.data ?? result.output);
 ```
 
 Results include `status`, `args`, `cwd`, `output`, and `truncated`. Executed
-commands also include `code`; valid stdout JSON within the output limit is
-available as `data`. Command failures return `status: "failed"` with diagnostics.
-Invalid arguments, blocked calls, and overlapping calls still throw.
+commands also include `code`. When stdout is a JSON object or array within the
+output limit, it is available as `data`; otherwise use `output`. Command
+failures return `status: "failed"` with diagnostics. Invalid arguments, blocked
+calls, and overlapping calls still throw.
 
 In TUI or RPC mode, mutations, hooks, aliases, and commands not recognized as
 inspection commands return `status: "queued"`. They haven't run yet: Pi runs
@@ -129,9 +131,10 @@ return await tools.worktrunk({ command: "switch", args: ["--create", "fix/parser
 ```
 
 Don't run Worktrunk calls in parallel. While a command is queued, Pi blocks
-further tool calls to prevent work in the old workspace. In print or JSON mode,
-commands execute immediately; `status: "stopped"` means you must restart Pi in
-the reported directory rather than continue the script.
+further tool calls for the rest of the turn to prevent work in the old
+workspace. In print or JSON mode, commands execute immediately;
+`status: "stopped"` means you must restart Pi in the reported directory rather
+than continue the script.
 
 ## 🧰 Requirements
 
