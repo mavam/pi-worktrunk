@@ -1,0 +1,9 @@
+created: 2026-09-30
+title: Progress spinner for /wt commands
+intro: >-
+  This release shows a spinner above the editor while `/wt` commands run and while
+  Pi moves your session, so slow aliases like `land` no longer leave the screen blank.
+  The spinner steps aside for approval dialogs and worktree pickers.
+source:
+  mode: sync-stable-queue
+  previous_stable: v0.11.0
