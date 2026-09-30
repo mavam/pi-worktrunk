@@ -8,6 +8,7 @@ import { basename, resolve, join, isAbsolute } from "node:path";
 import {
   SessionManager,
   keyText,
+  type AgentToolResult,
   type ExtensionAPI,
   type ExtensionCommandContext,
   type ExtensionContext,
@@ -162,7 +163,6 @@ type Execution = {
 type PendingContinuation = { key: string; nonce: string; expiresAt: number };
 
 const SESSION_TRANSITION_MESSAGE = "pi-worktrunk";
-const LEGACY_SESSION_TRANSITION_MESSAGE = "pi-worktrunk-session-transition";
 const CONTINUATION_MESSAGE_TYPE = "pi-worktrunk-continuation";
 const MAX_CONTINUATION_OUTPUT = 50_000;
 const CONTINUATION_ARG_PREFIX = "__pi_worktrunk_continuation=";
@@ -790,6 +790,61 @@ export function aliasFailureSummary(invocation: Invocation, output: string, code
   return `Alias \`${name}\` failed${exit} in one of its steps (${steps.join(" -> ")}). ` +
     "Steps run in order and stop at the first failure; Worktrunk does not report which one failed, so inspect the output above.";
 }
+/** Only known inspection commands run inside an active tool call. Hooks,
+ * aliases, mutations, and unknown future commands need the command boundary. */
+export function canRunInline(invocation: Invocation, isAlias: boolean): boolean {
+  if (isAlias) return false;
+  if (invocation.command === "list") return true;
+  const paths = [
+    ["step", "diff"], ["step", "eval"], ["hook", "show"],
+    ["config", "show"], ["config", "alias", "show"], ["config", "alias", "dry-run"],
+    ["config", "approvals", "list"], ["config", "state", "get"],
+    ["config", "state", "cache", "get"], ["config", "state", "default-branch", "get"],
+    ["config", "state", "logs", "get"], ["config", "state", "marker", "get"],
+    ["config", "state", "vars", "get"], ["config", "state", "vars", "list"],
+  ];
+  const words = [invocation.command, ...invocation.commandArgs];
+  return paths.some((path) => path.every((word, index) => words[index] === word));
+}
+
+const WorktrunkOutput = Type.Object({
+  status: StringEnum(["completed", "failed", "queued", "stopped"], {
+    description: "queued: not executed yet; stopped: session cannot continue. End the script immediately for either status.",
+  }),
+  args: Type.Array(Type.String()),
+  cwd: Type.String({ description: "Pi working directory when the command was invoked." }),
+  code: Type.Optional(Type.Integer({ description: "Worktrunk exit code; absent for queued commands." })),
+  output: Type.String({ description: "Bounded command output, including failure and continuation guidance." }),
+  truncated: Type.Boolean(),
+  data: Type.Optional(Type.Unknown({ description: "Parsed stdout JSON object or array, when valid and within the output limit." })),
+}, { additionalProperties: false });
+
+function toolReply(
+  status: "completed" | "failed" | "queued" | "stopped",
+  args: string[], cwd: string, text: string, result?: WtResult,
+): AgentToolResult<{ args: string[]; code?: number }> {
+  const output = boundedModelOutput(text);
+  let data: any;
+  if (result?.stdout && result.stdout.length <= MAX_CONTINUATION_OUTPUT) {
+    try {
+      const parsed = JSON.parse(result.stdout);
+      // Scalars such as `42` or `true` are plain values; `output` already carries them.
+      if (typeof parsed === "object" && parsed !== null) data = parsed;
+    } catch { /* Plain text is valid output too. */ }
+  }
+  return {
+    content: [{ type: "text", text: output }],
+    details: { args, ...(result ? { code: result.code } : {}) },
+    structuredContent: {
+      status, args, cwd, output, truncated: output !== text,
+      ...(result ? { code: result.code } : {}),
+      ...(data !== undefined ? { data } : {}),
+    },
+    ...(status === "failed" || (status === "stopped" && result && (result.code !== 0 || result.killed)) ? { isError: true } : {}),
+    ...(status === "queued" || status === "stopped" ? { terminate: true } : {}),
+  };
+}
+
 function isBareCommand(invocation: Invocation, command: string): boolean {
   return invocation.command === command && invocation.commandArgs.length === 0;
 }
@@ -892,8 +947,7 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
     }
     return new Text(text, outputPad, 0);
   };
-  pi.registerMessageRenderer?.(SESSION_TRANSITION_MESSAGE, renderTransition);
-  pi.registerMessageRenderer?.(LEGACY_SESSION_TRANSITION_MESSAGE, renderTransition);
+  pi.registerMessageRenderer(SESSION_TRANSITION_MESSAGE, renderTransition);
 
   const execWt: RunWt = (args, options) => pi.exec("wt", args, options);
   let aliases: WorktrunkAlias[] = [];
@@ -902,6 +956,9 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
   let worktrunkReference = "";
   let pendingContinuation: PendingContinuation | undefined;
   let placementInFlight = false;
+  let invocationInFlight = false;
+  // Set while a queued command waits for this agent run to end.
+  let blockToolCalls = false;
   const commandNames = new Set<string>();
   const aliasNames = new Set<string>();
 
@@ -1288,11 +1345,12 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
     pi.registerTool({
       name: "worktrunk",
       label: "Worktrunk",
-      description: `Run Worktrunk commands using the command reference generated from the installed binary. The command's remaining arguments pass directly to wt without shell expansion. Pi follows Worktrunk's directory-change directive, including from aliases and foreground hooks. Calls must be sequential: issue one Worktrunk call, wait for its result, then issue the next; a call made while another is still pending fails.${versionNotice}${referenceCatalog}${aliasCatalog}`,
+      description: `Run Worktrunk commands using the command reference generated from the installed binary. The command's remaining arguments pass directly to wt without shell expansion. Pi follows Worktrunk's directory-change directive, including from aliases and foreground hooks. Calls must be sequential: issue one Worktrunk call, wait for its result, then issue the next; a call made while another is still pending fails. Inspection commands return structured results immediately. In TUI/RPC, other commands return status queued and run after this turn. In codemode, end the script immediately on queued or stopped; do not run dependent tools until the continuation arrives. Command failures return status failed with diagnostics, not a thrown exception.${versionNotice}${referenceCatalog}${aliasCatalog}`,
       promptSnippet: "Run Worktrunk commands using the installed command, option, and example reference",
       promptGuidelines: [
         "Use worktrunk for Worktrunk commands. Select a command and its remaining arguments from the worktrunk reference and examples.",
         "The worktrunk tool follows Worktrunk's requested directory automatically.",
+        "In codemode, inspect worktrunk's status. End the script immediately on queued or stopped; queued commands have not run yet. Check failed before using results. Never run Worktrunk calls in parallel.",
         "Never pass -y/--yes to worktrunk; approving project commands is the user's decision, and Pi asks the user when Worktrunk needs approval.",
       ],
       parameters: Type.Object({
@@ -1301,29 +1359,7 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
           description: "Arguments after the Worktrunk command, in CLI order and without shell expansion.",
         })),
       }, { additionalProperties: false }),
-      prepareArguments(value): { command: string; args?: string[] } {
-        const input = value as { command?: unknown; args?: unknown } | undefined;
-        if (typeof input?.command === "string") {
-          return {
-            command: input.command,
-            ...(Array.isArray(input.args) ? { args: input.args.filter((arg): arg is string => typeof arg === "string") } : {}),
-          };
-        }
-        if (Array.isArray(input?.args) && input.args.every((arg) => typeof arg === "string")) {
-          const legacyArgs = input.args as string[];
-          const invocation = parseWtInvocation(legacyArgs.map(quoteArgument).join(" "));
-          if (invocation.command !== undefined && invocation.commandIndex !== undefined) {
-            return {
-              command: invocation.command,
-              args: [
-                ...legacyArgs.slice(0, invocation.commandIndex),
-                ...legacyArgs.slice(invocation.commandIndex + 1),
-              ],
-            };
-          }
-        }
-        return value as { command: string; args?: string[] };
-      },
+      outputSchema: WorktrunkOutput,
       executionMode: "sequential",
       async execute(_id, params, _signal, _update, ctx) {
         const args = [params.command, ...(params.args ?? [])];
@@ -1341,77 +1377,80 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
           pendingContinuation = undefined;
           placementInFlight = false;
         }
-        if (placementInFlight) {
+        if (placementInFlight || invocationInFlight) {
           throw new WorktrunkError("Another model-triggered Worktrunk invocation is still pending. Worktrunk tool calls run sequentially: wait for the previous result, then call again.");
         }
 
-        if (ctx.mode === "print" || ctx.mode === "json") {
-          const commonDir = await readCommonDir(ctx.cwd, _signal);
-          const identity = commonDir ? repositoryIdentity(commonDir) : undefined;
-          const result = await invoke(args, { cwd: ctx.cwd, signal: _signal });
-          const output = boundedModelOutput(
-            [result.stdout?.trimEnd(), result.stderr?.trimEnd()].filter(Boolean).join("\n"),
-          );
-          const details = { args, code: result.code };
-          const pending = result.code !== 0 && !result.killed && isApprovalFailure(output)
-            ? await pendingApprovals(approvalScope(invocation, ctx.cwd), ctx.cwd)
-            : undefined;
-          const approval = approvalFailureDetails(output, pending);
-          let stopReason: string | undefined;
-          try {
-            const destination = await directedDestination(result.directive, identity);
-            if (destination && canonicalPath(destination) !== canonicalPath(ctx.cwd)) {
-              stopReason = `Worktrunk requested ${destination}. Session movement requires TUI or RPC mode; restart Pi there.`;
-            } else {
-              const current = await readCommonDir(ctx.cwd);
-              if (!current || !sameRepositoryIdentity(identity, repositoryIdentity(current))) {
-                stopReason = `Pi's working directory no longer exists or is not the original Git worktree: ${ctx.cwd}. Restart Pi in a surviving worktree.`;
+        const signal = ctx.signal ?? _signal;
+        signal?.throwIfAborted();
+        invocationInFlight = true;
+        try {
+          if (ctx.mode === "print" || ctx.mode === "json" || canRunInline(invocation, aliasNames.has(params.command))) {
+            const commonDir = await readCommonDir(ctx.cwd, signal);
+            const identity = commonDir ? repositoryIdentity(commonDir) : undefined;
+            let result: WtResult;
+            try { result = await invoke(args, { cwd: ctx.cwd, signal }); }
+            catch (error) {
+              result = { code: -1, stderr: error instanceof Error ? error.message : String(error), killed: signal?.aborted };
+            }
+            const output = [result.stdout?.trimEnd(), result.stderr?.trimEnd()].filter(Boolean).join("\n");
+            const pending = result.code !== 0 && !result.killed && isApprovalFailure(output)
+              ? await pendingApprovals(approvalScope(invocation, ctx.cwd), ctx.cwd, signal)
+              : undefined;
+            const approval = approvalFailureDetails(output, pending);
+            let stopReason: string | undefined;
+            try {
+              const destination = await directedDestination(result.directive, identity);
+              if (destination && canonicalPath(destination) !== canonicalPath(ctx.cwd)) {
+                stopReason = `Worktrunk requested ${destination}. This tool call cannot move the session; restart Pi there.`;
+              } else {
+                const current = await readCommonDir(ctx.cwd);
+                if (!current || !sameRepositoryIdentity(identity, repositoryIdentity(current))) {
+                  stopReason = `Pi's working directory no longer exists or is not the original Git worktree: ${ctx.cwd}. Restart Pi in a surviving worktree.`;
+                }
               }
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              const current = await readCommonDir(ctx.cwd);
+              if (current && sameRepositoryIdentity(identity, repositoryIdentity(current))) {
+                return toolReply("failed", args, ctx.cwd, [output, approval, message].filter(Boolean).join("\n\n"), result);
+              }
+              stopReason = message;
             }
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            const current = await readCommonDir(ctx.cwd);
-            if (current && sameRepositoryIdentity(identity, repositoryIdentity(current))) {
-              throw new WorktrunkError(boundedModelOutput([output, approval, message].filter(Boolean).join("\n\n")));
+            if (stopReason) {
+              ctx.abort();
+              return toolReply("stopped", args, ctx.cwd, [output, approval, stopReason].filter(Boolean).join("\n\n"), result);
             }
-            stopReason = message;
+            if (result.code !== 0 || result.killed) {
+              const failure = formatWtFailure(args, result, ctx.cwd);
+              return toolReply("failed", args, ctx.cwd,
+                [failure, aliasFailureSummary(invocation, failure, result.code), approvalFailureDetails(failure, pending)].filter(Boolean).join("\n"), result);
+            }
+            return toolReply("completed", args, ctx.cwd, output || `wt ${args.join(" ")} completed successfully.`, result);
           }
-          if (stopReason) {
-            ctx.abort();
-            return {
-              content: [{ type: "text" as const, text: [output, approval, stopReason].filter(Boolean).join("\n\n") }],
-              details,
-              terminate: true,
-            };
-          }
-          if (result.code !== 0 || result.killed) {
-            const failure = formatWtFailure(args, result, ctx.cwd);
-            throw new WorktrunkError(boundedModelOutput(
-              [failure, aliasFailureSummary(invocation, failure, result.code), approvalFailureDetails(failure, pending)].filter(Boolean).join("\n"),
-            ));
-          }
-          return {
-            content: [{ type: "text" as const, text: output || `wt ${args.join(" ")} completed successfully.` }],
-            details,
+          const nonce = randomUUID();
+          placementInFlight = true;
+          pendingContinuation = {
+            key: JSON.stringify(args),
+            nonce,
+            expiresAt: Date.now() + 5 * 60_000,
           };
+          const marker = `${CONTINUATION_ARG_PREFIX}${nonce}`;
+          try {
+            pi.sendUserMessage(
+              `/wt ${[...args, marker].map(quoteArgument).join(" ")}`,
+              { deliverAs: "followUp", expandPromptTemplates: true },
+            );
+          } catch (error) {
+            pendingContinuation = undefined;
+            placementInFlight = false;
+            throw error;
+          }
+          blockToolCalls = true;
+          return toolReply("queued", args, ctx.cwd, `Queued wt ${args.join(" ")}. Worktrunk will run after this turn, and the result will be returned before work continues. End this script now; do not run dependent tools yet.`);
+        } finally {
+          invocationInFlight = false;
         }
-        const nonce = randomUUID();
-        placementInFlight = true;
-        pendingContinuation = {
-          key: JSON.stringify(args),
-          nonce,
-          expiresAt: Date.now() + 5 * 60_000,
-        };
-        const marker = `${CONTINUATION_ARG_PREFIX}${nonce}`;
-        pi.sendUserMessage(
-          `/wt ${[...args, marker].map(quoteArgument).join(" ")}`,
-          { deliverAs: "followUp", expandPromptTemplates: true },
-        );
-        return {
-          content: [{ type: "text" as const, text: `Queued wt ${args.join(" ")}. Worktrunk will run after this turn, and the result will be returned before work continues.` }],
-          details: { args },
-          terminate: true,
-        };
       },
       renderCall(args, theme) {
         const invocation = [args.command, ...(args.args ?? [])].filter((value): value is string => typeof value === "string");
@@ -1430,12 +1469,32 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
   // catalog after repository-specific discovery.
   registerTool();
 
+  // Nested tools do not propagate terminate to their caller. Prevent a script
+  // (or a subsequent model tool call) from using the old workspace after a
+  // command is queued. The block ends with the agent run, before the queued
+  // command executes, so it cannot outlive a dropped follow-up.
+  pi.on("tool_call", () => {
+    if (blockToolCalls) {
+      return {
+        block: true,
+        reason: "A Worktrunk command is queued and has not run yet. End this script/turn and wait for its continuation before calling more tools.",
+        terminate: true,
+      };
+    }
+  });
+
   pi.on("session_start", async (_event, ctx) => {
     await discoverCommandsAndAliases(ctx);
     registerTool();
     await tracker.markWaiting(ctx.cwd);
   });
   pi.on("agent_start", (_event, ctx) => tracker.markWorking(ctx.cwd));
-  pi.on("agent_end", (_event, ctx) => tracker.markWaiting(ctx.cwd));
-  pi.on("session_shutdown", (_event, ctx) => tracker.clear(ctx.cwd));
+  pi.on("agent_end", (_event, ctx) => {
+    blockToolCalls = false;
+    return tracker.markWaiting(ctx.cwd);
+  });
+  pi.on("session_shutdown", (_event, ctx) => {
+    blockToolCalls = false;
+    return tracker.clear(ctx.cwd);
+  });
 }

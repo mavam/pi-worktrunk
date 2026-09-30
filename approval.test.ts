@@ -245,10 +245,11 @@ test("without a UI the failure carries the hint and the pending commands", async
 for (const mode of ["print", "json"] as const) {
   test(`${mode} tool failures carry the hint and the pending commands`, async () => {
     await withHarness({ results: [APPROVAL_FAILURE] }, async (harness) => {
-      await assert.rejects(
-        harness.tool("remove", ["topic"], mode),
-        /Cannot prompt for approval.*wt config approvals add.*Unapproved project commands:.*devenv revoke/s,
-      );
+      const result = await harness.tool("remove", ["topic"], mode);
+      assert.equal(result.isError, true);
+      assert.equal(result.structuredContent.status, "failed");
+      assert.match(result.structuredContent.output,
+        /Cannot prompt for approval.*wt config approvals add.*Unapproved project commands:.*devenv revoke/s);
       assert.equal(harness.prompts.length, 0);
       assert.deepEqual(harness.approvalsAdded, []);
     });

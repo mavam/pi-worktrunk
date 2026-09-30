@@ -61,7 +61,7 @@ for (const scenario of ["exit", "spawn", "directive", "switch", "preflight"] as 
         assert.match(messages[0].message.content, expected[scenario]);
         if (scenario === "directive" || scenario === "switch") assert.match(messages[0].message.content, /command output/);
         // Recovery must release the pending-invocation guard.
-        await assert.doesNotReject(tool.execute("retry", { command: "list" }, undefined, undefined, ctx));
+        await assert.doesNotReject(tool.execute("retry", { command: "switch", args: ["topic"] }, undefined, undefined, ctx));
       } finally { await rm(root, { recursive: true, force: true }); }
     });
   }
@@ -80,9 +80,12 @@ for (const mode of ["print", "json"] as const) {
           return { code: 0, stdout: args.includes("--is-inside-work-tree") ? "true\n" : root };
         },
       } as any, async () => ({ code: 1, stderr: "hook failed", directive: "invalid\n" }));
-      await assert.rejects(tools.get("worktrunk").execute("call", { command: "land" }, undefined, undefined, {
+      const result = await tools.get("worktrunk").execute("call", { command: "land" }, undefined, undefined, {
         mode, cwd: root, abort() { aborted = true; },
-      }), /hook failed.*Rejected Worktrunk destination/s);
+      });
+      assert.equal(result.isError, true);
+      assert.equal(result.structuredContent.status, "failed");
+      assert.match(result.content[0].text, /hook failed.*Rejected Worktrunk destination/s);
       assert.equal(aborted, false);
     } finally { await rm(root, { recursive: true, force: true }); }
   });

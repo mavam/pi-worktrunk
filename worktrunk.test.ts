@@ -281,12 +281,7 @@ test("tool registers synchronously before repository-specific discovery", async 
   assert.match(tool.description, /Example: \{"command":"deploy","args":\[\]\}/);
   assert.match(tool.promptSnippet, /installed command, option, and example reference/);
   assert.ok(tool.promptGuidelines.some((guideline: string) => guideline.includes("reference and examples")));
-  assert.deepEqual(tool.prepareArguments({ args: ["switch", "--create", "fix/parser"] }), {
-    command: "switch", args: ["--create", "fix/parser"],
-  });
-  assert.deepEqual(tool.prepareArguments({ args: ["-v", "land", "two words"] }), {
-    command: "land", args: ["-v", "two words"],
-  });
+  assert.equal(tool.prepareArguments, undefined);
   assert.deepEqual(commands.get("wt").getArgumentCompletions("sw"), [
     { value: "switch", label: "switch" },
   ]);
@@ -594,19 +589,14 @@ test("model list bypasses the picker and receives Worktrunk output", async () =>
     const manager = SessionManager.create(source, join(root, "sessions"));
     manager.appendSessionInfo("test");
     await handlers.get("session_start")({}, { cwd: source, sessionManager: manager });
-    await tools.get("worktrunk").execute("call", { command: "list" }, undefined, undefined, {
-      cwd: source, hasUI: true, ui: {},
+    const result = await tools.get("worktrunk").execute("call", { command: "list" }, undefined, undefined, {
+      cwd: source, mode: "tui", hasUI: true,
+      ui: { async select() { throw new Error("model list must not open a picker"); } },
     });
-    await commands.get("wt").handler(sent[0].text.slice(4), {
-      cwd: source, mode: "tui", hasUI: true, sessionManager: manager,
-      async waitForIdle() {},
-      ui: {
-        notify() {},
-        async select() { throw new Error("model list must not open a picker"); },
-      },
-    });
-    assert.match(messages.at(-1)?.message.content ?? "", /completed successfully.*main worktree/s);
-    assert.equal(messages.at(-1)?.options.triggerTurn, true);
+    assert.equal(result.structuredContent.status, "completed");
+    assert.equal(result.structuredContent.output, "main worktree");
+    assert.deepEqual(sent, []);
+    assert.deepEqual(messages, []);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
@@ -755,7 +745,7 @@ test("transition renderer keeps move and recovery variants compact", () => {
   const renderers = new Map<string, any>();
   extension(baseApi({ handlers, commands, tools, renderer: renderers, async exec() { return { code: 0, stdout: "" }; } }));
   const renderer = renderers.get("pi-worktrunk");
-  assert.ok(renderers.has("pi-worktrunk-session-transition"));
+  assert.deepEqual([...renderers.keys()], ["pi-worktrunk"]);
   const theme = {
     fg(color: string, text: string) { return `<${color}>${text}</${color}>`; },
     bold(text: string) { return `<bold>${text}</bold>`; },
