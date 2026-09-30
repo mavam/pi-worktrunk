@@ -1,0 +1,9 @@
+created: 2026-09-30
+title: Structured Worktrunk results for codemode
+intro: >-
+  This release lets codemode scripts consume Worktrunk results directly, with structured
+  output for inspection commands and explicit handoffs for commands that move sessions.
+  It also raises the minimum supported Pi version to 0.99.1.
+source:
+  mode: sync-stable-queue
+  previous_stable: v0.10.1
