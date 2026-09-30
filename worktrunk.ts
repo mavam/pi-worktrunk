@@ -17,7 +17,7 @@ import {
   type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { Box, Text } from "@earendil-works/pi-tui";
+import { Box, Loader, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 export const MARKERS = { working: "🤖", waiting: "💬" } as const;
@@ -909,6 +909,36 @@ function sameRepositoryIdentity(left?: RepositoryIdentity, right?: RepositoryIde
 }
 
 const COMMAND_ENTRY_TYPE = "pi-worktrunk-command-result";
+const PROGRESS_WIDGET = "pi-worktrunk-progress";
+
+/** Spinner above the editor while a slash command works; nothing else signals progress outside agent turns. */
+type Progress = { show(label: string): void; hide(): void };
+
+function createProgress(ctx: ExtensionCommandContext): Progress {
+  const enabled = ctx.mode === "tui" && ctx.hasUI;
+  let label: string | undefined;
+  return {
+    show(next) {
+      if (!enabled || label === next) return;
+      label = next;
+      ctx.ui.setWidget(PROGRESS_WIDGET, (tui, theme) => {
+        const loader = new Loader(tui, (text) => theme.fg("accent", text), (text) => theme.fg("muted", text), next);
+        return Object.assign(loader, { dispose: () => loader.stop() });
+      });
+    },
+    // Hide before switching sessions: the old context is stale afterwards.
+    hide() {
+      if (label === undefined) return;
+      label = undefined;
+      ctx.ui.setWidget(PROGRESS_WIDGET, undefined);
+    },
+  };
+}
+
+function runningLabel(args: readonly string[]): string {
+  const command = `wt ${args.join(" ")}`.replace(/\s+/g, " ").trim();
+  return `Running ${command.length > 80 ? `${command.slice(0, 79)}…` : command}`;
+}
 type CommandDisplay = { args: string[]; output: string; isError: boolean };
 
 function renderWorktrunkCall(args: string[], theme: Theme): Text {
@@ -1067,6 +1097,7 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
     ctx: ExtensionCommandContext,
     args: readonly string[],
     scope: string[],
+    progress: Progress,
     known?: ProjectCommand[],
   ): Promise<ApprovalOutcome> {
     const pending = known ?? await pendingApprovals(scope, ctx.cwd, ctx.signal);
@@ -1074,6 +1105,8 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
       return { approved: false, message: `Could not determine which project commands need approval.\n${APPROVAL_HINT}` };
     }
     const listing = formatProjectCommands(pending);
+    // The dialog replaces the editor; a spinner would suggest Worktrunk is busy.
+    progress.hide();
     const confirmed = await ctx.ui.confirm(
       "Approve Worktrunk project commands?",
       `\`wt ${args.join(" ")}\` needs approval to run these project commands. ` +
@@ -1083,6 +1116,7 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
     if (!confirmed) {
       return { approved: false, message: `Approval declined; Worktrunk did not run these project commands:\n${listing}` };
     }
+    progress.show("Approving project commands");
     // `approvals add --yes` approves whatever is pending when it runs. Refuse if
     // that differs from what the user just reviewed.
     const current = await pendingApprovals(scope, ctx.cwd, ctx.signal);
@@ -1147,9 +1181,22 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
 
   async function executeInvocation(invocation: Invocation, ctx: ExtensionCommandContext, modelOrigin = false): Promise<Execution> {
     await ctx.waitForIdle();
+    const progress = createProgress(ctx);
+    try { return await runInvocation(invocation, ctx, modelOrigin, progress); }
+    finally { progress.hide(); }
+  }
+
+  async function runInvocation(
+    invocation: Invocation,
+    ctx: ExtensionCommandContext,
+    modelOrigin: boolean,
+    progress: Progress,
+  ): Promise<Execution> {
     const interactive = ctx.mode !== "print" && ctx.mode !== "json";
     if (!modelOrigin && isBareCommand(invocation, "list") && interactive && ctx.hasUI) {
+      progress.show("Loading worktrees");
       const worktrees = await client.list(ctx.cwd, ctx.signal);
+      progress.hide();
       if (!worktrees.length) displayCommand(ctx, invocation.args, "No worktrees found.", false, modelOrigin);
       else {
         const selected = await chooseWorktree(ctx, "Select a worktree to inspect", worktrees);
@@ -1158,6 +1205,7 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
       return { result: { code: 0 }, output: "", moved: false, canContinue: true };
     }
 
+    progress.show(runningLabel(invocation.args));
     const commonDir = await readCommonDir(ctx.cwd, ctx.signal);
     const identity = commonDir ? repositoryIdentity(commonDir) : undefined;
     const before = await safeList(ctx.cwd, ctx.signal);
@@ -1165,6 +1213,7 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
     const source: SessionLocation = { branch: sourceItem?.branch ?? null, path: ctx.cwd, commonDir };
     let args = invocation.args;
     if (!modelOrigin && isBareCommand(invocation, "switch") && interactive && ctx.hasUI) {
+      progress.hide();
       const selected = await chooseWorktree(ctx, "Select a worktree", before.filter((item) => item.worktree?.path));
       if (!selected?.worktree?.path) {
         return { result: { code: 0 }, output: "", moved: false, canContinue: true };
@@ -1184,7 +1233,7 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
       // ask before running rather than retrying afterwards.
       const pending = await pendingApprovals(scope, ctx.cwd, ctx.signal);
       if (pending?.length) {
-        const outcome = await requestApproval(ctx, args, scope, pending);
+        const outcome = await requestApproval(ctx, args, scope, progress, pending);
         if (!outcome.approved) {
           const output = `wt ${args.join(" ")} did not run. ${outcome.message}`;
           displayCommand(ctx, args, output, true, modelOrigin);
@@ -1200,15 +1249,17 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
     };
     const combine = (value: WtResult) => [value.stdout?.trimEnd(), value.stderr?.trimEnd()].filter(Boolean).join("\n");
     const approvalFailed = (value: WtResult, text: string) => value.code !== 0 && !value.killed && isApprovalFailure(text);
+    progress.show(runningLabel(args));
     let result = await run();
     let output = combine(result);
     let explained = false;
     if (approvalFailed(result, output) && canPrompt) {
       explained = true;
-      const outcome = await requestApproval(ctx, args, scope);
+      const outcome = await requestApproval(ctx, args, scope, progress);
       if (outcome.approved && retrySafe) {
         // Worktrunk checks approvals before acting, so nothing ran; retry once.
         notes.push(outcome.message);
+        progress.show(runningLabel(args));
         result = await run();
         output = combine(result);
         explained = false;
@@ -1222,6 +1273,7 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
       output = [output, await describeApprovalFailure(output, scope, ctx.cwd, ctx.signal)].filter(Boolean).join("\n");
     }
     output = [...notes, output].filter(Boolean).join("\n\n");
+    progress.hide();
     displayCommand(ctx, args, output, result.code !== 0 || Boolean(result.killed), modelOrigin);
     const base: Execution = { result, output, moved: false, canContinue: false };
     const continuation = modelOrigin ? continuationMessage(invocation, base) : undefined;
@@ -1236,12 +1288,14 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
           emit(ctx, `Worktrunk requested ${directed}. Continue Pi there; this session cannot move.`, "warning");
           return { ...base, canContinue: false };
         }
+        progress.show("Moving session");
         const items = await safeList(directed);
         const target: SessionLocation = {
           path: directed,
           branch: items.find((item) => item.worktree?.current)?.branch ?? null,
           commonDir,
         };
+        progress.hide();
         await activate(ctx, source, target, continuation);
         return { ...base, moved: true, canContinue: true };
       }

@@ -24,7 +24,9 @@ pi install npm:pi-worktrunk
 Pi passes arguments directly to Worktrunk. Worktrunk flags and configured aliases
 work without extension-specific syntax.
 
-In the terminal UI, completed slash commands appear as Worktrunk cards with the
+In the terminal UI, a spinner above the editor shows that a slash command is
+running, for example `Running wt land`, and a second one appears while Pi moves
+the session. Completed slash commands appear as Worktrunk cards with the
 same header and success/error styling as model-invoked tools. Their output stays
 in the transcript, including after a worktree move, without triggering a model
 response.

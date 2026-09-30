@@ -45,7 +45,7 @@ for (const scenario of ["exit", "spawn", "directive", "switch", "preflight"] as 
         });
         const ctx = {
           mode, cwd: source, hasUI: true, sessionManager: manager,
-          ui: { notify() {} },
+          ui: { notify() {}, setWidget() {} },
           async waitForIdle() { if (scenario === "preflight") throw new Error("preflight failed"); },
           async switchSession() { return { cancelled: true }; },
         };

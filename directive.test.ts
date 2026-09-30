@@ -154,7 +154,7 @@ for (const scenario of [
       await commands.get("wt").handler(sent[0].slice(4), {
         mode: "tui", cwd: source, hasUI: true, sessionManager: manager,
         async waitForIdle() {},
-        ui: { notify(text: string) { notifications.push(text); } },
+        ui: { notify(text: string) { notifications.push(text); }, setWidget() {} },
         async switchSession(path: string, options: any) {
           requested = path;
           if (scenario === "cancel-switch") return { cancelled: true };

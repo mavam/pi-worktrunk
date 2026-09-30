@@ -548,12 +548,12 @@ test("create-and-switch moves and resumes model work", async () => {
       async switchSession(path: string, options: any) {
         switched = path;
         await options.withSession({
-          ui: { notify() {} },
+          ui: { notify() {}, setWidget() {} },
           async sendMessage(message: any, opts: any) { continuation = { message, opts }; },
         });
         return { cancelled: false };
       },
-      ui: { notify() {} },
+      ui: { notify() {}, setWidget() {} },
     });
     assert.ok(wtCalls.some((args) => args.join("\0") === ["switch", "--create", "fix/parser"].join("\0")));
     const destination = SessionManager.open(switched, sessions);
@@ -629,7 +629,7 @@ test("JSON mode runs exact argv without replacing the session", async () => {
     await commands.get("wt").handler("-v switch main", {
       cwd: source, mode: "json", hasUI: false, sessionManager: manager,
       async waitForIdle() {}, async switchSession() { switches += 1; return { cancelled: false }; },
-      ui: { notify() {} },
+      ui: { notify() {}, setWidget() {} },
     });
     assert.deepEqual(
       calls.filter((args) =>
@@ -671,7 +671,7 @@ test("ambiguous creations stay in the source session", async () => {
     await commands.get("wt").handler("deploy", {
       cwd: source, mode: "tui", hasUI: true, sessionManager: manager,
       async waitForIdle() {}, async switchSession() { switches++; return { cancelled: false }; },
-      ui: { notify() {} },
+      ui: { notify() {}, setWidget() {} },
     });
     assert.equal(switches, 0);
   } finally { await rm(root, { recursive: true, force: true }); }
@@ -723,14 +723,14 @@ test("a failed command that removes the cwd follows its directive and resumes wi
       async switchSession(path: string, options: any) {
         switched = path;
         await options.withSession({
-          ui: { notify() {} },
+          ui: { notify() {}, setWidget() {} },
           async sendMessage(message: any, sendOptions: any) {
             continuation = { message, options: sendOptions };
           },
         });
         return { cancelled: false };
       },
-      ui: { notify() {} },
+      ui: { notify() {}, setWidget() {} },
     });
     assert.equal(SessionManager.open(switched, sessions).getCwd(), main);
     assert.match(continuation.message.content, /failed \(exit 1\).*land failed after cleanup/s);
