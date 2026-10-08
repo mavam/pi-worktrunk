@@ -880,7 +880,7 @@ async function chooseWorktree(ctx: ExtensionCommandContext, title: string, items
   return index < 0 ? undefined : items[index];
 }
 
-function createLinkedSession(ctx: ExtensionCommandContext, source: SessionLocation, target: SessionLocation): string {
+function createLinkedSession(ctx: ExtensionCommandContext, source: SessionLocation, target: SessionLocation, kind: SessionTransitionKind = "move"): string {
   const sourceSession = ctx.sessionManager.getSessionFile();
   if (!sourceSession) throw new WorktrunkError("Cannot move an ephemeral Pi session.");
   let snapshot: SessionSnapshot | undefined;
@@ -896,7 +896,7 @@ function createLinkedSession(ctx: ExtensionCommandContext, source: SessionLocati
     SESSION_TRANSITION_MESSAGE,
     "",
     true,
-    { kind: "move", source, target, sourceSession, destinationSession } satisfies SessionTransitionDetails,
+    { kind, source, target, sourceSession, destinationSession } satisfies SessionTransitionDetails,
   );
   return destinationSession;
 }
@@ -987,6 +987,13 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
   let pendingContinuation: PendingContinuation | undefined;
   let placementInFlight = false;
   let invocationInFlight = false;
+  // Capture while the worktree exists: Git cannot discover its repository after removal.
+  let recoveryState: {
+    source: SessionLocation;
+    identity: RepositoryIdentity;
+    worktreeIdentity: RepositoryIdentity;
+    candidates: WorktreeItem[];
+  } | undefined;
   // Set while a queued command waits for this agent run to end.
   let blockToolCalls = false;
   const commandNames = new Set<string>();
@@ -1017,6 +1024,57 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
   async function safeList(cwd: string, signal?: AbortSignal): Promise<WorktreeItem[]> {
     try { return await client.list(cwd, signal); } catch { return []; }
   }
+  async function readWorktreeIdentity(cwd: string): Promise<RepositoryIdentity | undefined> {
+    try {
+      const result = await pi.exec("git", ["rev-parse", "--absolute-git-dir"], { cwd, timeout: 5000 });
+      return result.code === 0 && result.stdout.trim()
+        ? repositoryIdentity(canonicalPath(resolve(cwd, result.stdout.trim()))) : undefined;
+    } catch { return undefined; }
+  }
+
+  async function rememberWorktree(cwd: string, commonDir: string, items: WorktreeItem[]) {
+    const identity = repositoryIdentity(commonDir);
+    const worktreeIdentity = await readWorktreeIdentity(cwd);
+    if (!identity || !worktreeIdentity) return;
+    const previous = recoveryState?.source.path === cwd &&
+      sameRepositoryIdentity(recoveryState.identity, identity) &&
+      sameRepositoryIdentity(recoveryState.worktreeIdentity, worktreeIdentity) ? recoveryState : undefined;
+    recoveryState = {
+      source: { path: cwd, branch: items.find((item) => item.worktree?.current)?.branch ?? previous?.source.branch ?? null, commonDir },
+      identity,
+      worktreeIdentity,
+      // A transient list failure must not discard previously verified survivors.
+      candidates: items.length ? items.filter((item) => item.worktree?.path)
+        .sort((a, b) => Number(Boolean(b.worktree?.main)) - Number(Boolean(a.worktree?.main)))
+        : previous?.candidates ?? [],
+    };
+  }
+
+  async function usableWorktree(cwd: string, identity: RepositoryIdentity | undefined): Promise<boolean> {
+    try { if (!statSync(cwd).isDirectory()) return false; } catch { return false; }
+    // Global commands may run from directories that were never Git worktrees.
+    if (recoveryState?.source.path !== cwd) return true;
+    return sameRepositoryIdentity(recoveryState.identity, identity) &&
+      sameRepositoryIdentity(recoveryState.worktreeIdentity, await readWorktreeIdentity(cwd));
+  }
+
+  async function recoveryDestination(cwd: string): Promise<SessionLocation | undefined> {
+    const state = recoveryState;
+    if (!state || state.source.path !== cwd ||
+        !sameRepositoryIdentity(state.identity, repositoryIdentity(state.identity.commonDir))) return undefined;
+    for (const item of state.candidates) {
+      const path = item.worktree!.path!;
+      const commonDir = await readCommonDir(path);
+      if (!commonDir || !sameRepositoryIdentity(state.identity, repositoryIdentity(commonDir))) continue;
+      // Refresh the label; the branch may have changed since the snapshot.
+      const current = (await safeList(path)).find((entry) => entry.worktree?.current);
+      // A removed nested worktree can become an ordinary directory of main.
+      if (!current?.worktree?.path || canonicalPath(current.worktree.path) !== canonicalPath(path)) continue;
+      return { path, commonDir, branch: current.branch };
+    }
+    return undefined;
+  }
+
   async function discoverCommandsAndAliases(ctx: ExtensionContext) {
     aliases = [];
     installedCommands = [];
@@ -1167,8 +1225,9 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
     source: SessionLocation,
     target: SessionLocation,
     continuation?: ReturnType<typeof continuationMessage>,
+    kind: SessionTransitionKind = "move",
   ) {
-    const destinationSession = createLinkedSession(ctx, source, target);
+    const destinationSession = createLinkedSession(ctx, source, target, kind);
     const result = await ctx.switchSession(destinationSession, {
       withSession: async (nextCtx) => {
         if (continuation) {
@@ -1177,6 +1236,36 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
       },
     });
     if (result.cancelled) throw new WorktrunkError(`Pi created ${destinationSession}, but session switching was cancelled.`);
+  }
+
+  async function recover(
+    ctx: ExtensionCommandContext, invocation: Invocation, execution: Execution,
+    modelOrigin: boolean, progress: Progress, skipped = false,
+  ): Promise<Execution> {
+    const target = await recoveryDestination(ctx.cwd);
+    const notice = skipped
+      ? `wt ${invocation.args.join(" ")} was not run because its working directory is no longer usable.`
+      : "Pi's working directory is no longer usable after the command.";
+    execution.output = [execution.output, notice].filter(Boolean).join("\n\n");
+    if (!target || ctx.mode === "print" || ctx.mode === "json" || !ctx.sessionManager.getSessionFile()) {
+      const message = target
+        ? `${notice} Restart Pi in ${target.path}; this session cannot move.`
+        : `${notice} No verified surviving worktree is available; restart Pi in a surviving worktree.`;
+      emit(ctx, message, "error");
+      return { ...execution, output: [execution.output, message].join("\n\n"), canContinue: false };
+    }
+    const source = recoveryState!.source;
+    const message = modelOrigin ? continuationMessage(invocation, execution) : undefined;
+    const continuation = message ? {
+      ...message,
+      content: message.content + `\n\nSession recovered to ${target.path}. ` + (skipped
+        ? "The requested command was not executed. Re-evaluate it in this new worktree before deciding what to do next; do not blindly replay it."
+        : "The command already ran in the previous worktree. Do not replay it. Continue the original task from the recovery worktree."),
+    } : undefined;
+    progress.hide();
+    emit(ctx, `${notice} Recovering the session to ${target.path}.`, "warning");
+    await activate(ctx, source, target, continuation, "recovery");
+    return { ...execution, moved: true, canContinue: true };
   }
 
   async function executeInvocation(invocation: Invocation, ctx: ExtensionCommandContext, modelOrigin = false): Promise<Execution> {
@@ -1193,6 +1282,16 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
     progress: Progress,
   ): Promise<Execution> {
     const interactive = ctx.mode !== "print" && ctx.mode !== "json";
+    const commonDir = await readCommonDir(ctx.cwd, ctx.signal);
+    ctx.signal?.throwIfAborted();
+    const identity = commonDir ? repositoryIdentity(commonDir) : undefined;
+    const usable = await usableWorktree(ctx.cwd, identity);
+    ctx.signal?.throwIfAborted();
+    if (!usable) {
+      return recover(ctx, invocation, { result: { code: -1 }, output: "", moved: false, canContinue: false }, modelOrigin, progress, true);
+    }
+    const before = await safeList(ctx.cwd, ctx.signal);
+    if (commonDir) await rememberWorktree(ctx.cwd, commonDir, before);
     if (!modelOrigin && isBareCommand(invocation, "list") && interactive && ctx.hasUI) {
       progress.show("Loading worktrees");
       const worktrees = await client.list(ctx.cwd, ctx.signal);
@@ -1206,9 +1305,6 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
     }
 
     progress.show(runningLabel(invocation.args));
-    const commonDir = await readCommonDir(ctx.cwd, ctx.signal);
-    const identity = commonDir ? repositoryIdentity(commonDir) : undefined;
-    const before = await safeList(ctx.cwd, ctx.signal);
     const sourceItem = before.find((item) => item.worktree?.current);
     const source: SessionLocation = { branch: sourceItem?.branch ?? null, path: ctx.cwd, commonDir };
     let args = invocation.args;
@@ -1304,13 +1400,16 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
       emit(ctx, message, "error");
       base.output = [output, message].filter(Boolean).join("\n\n");
       base.result = { ...result, code: result.code || -1 };
-      // A rejected directive or cancelled session switch is recoverable when
-      // the source worktree is still usable. Return the diagnostic to the model.
+      const current = await readCommonDir(ctx.cwd);
+      base.canContinue = await usableWorktree(ctx.cwd, current ? repositoryIdentity(current) : undefined) &&
+        (!identity || sameRepositoryIdentity(identity, current ? repositoryIdentity(current) : undefined));
+      // Never turn a rejected directive or cancelled switch into a different move.
+      return base;
     }
     const currentCommonDir = await readCommonDir(ctx.cwd);
-    base.canContinue = Boolean(identity && currentCommonDir &&
-      sameRepositoryIdentity(identity, repositoryIdentity(currentCommonDir)));
-    if (!base.canContinue) emit(ctx, "Pi's working directory is no longer usable. No destination was requested; restart Pi in a surviving worktree.", "error");
+    base.canContinue = await usableWorktree(ctx.cwd, currentCommonDir ? repositoryIdentity(currentCommonDir) : undefined) &&
+      (!identity || sameRepositoryIdentity(identity, currentCommonDir ? repositoryIdentity(currentCommonDir) : undefined));
+    if (!base.canContinue) return recover(ctx, invocation, base, modelOrigin, progress);
     return base;
   }
 
@@ -1368,7 +1467,8 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
           message = [message, await describeApprovalFailure(message, scope, ctx.cwd)].filter(Boolean).join("\n");
         }
         emit(ctx, message, "error");
-        if (modelInvocation && await readCommonDir(ctx.cwd)) {
+        const commonDir = modelInvocation ? await readCommonDir(ctx.cwd) : undefined;
+        if (modelInvocation && await usableWorktree(ctx.cwd, commonDir ? repositoryIdentity(commonDir) : undefined)) {
           pi.sendMessage(continuationMessage(modelInvocation, {
             result: { code: -1 }, output: message, moved: false, canContinue: true,
           }), { triggerTurn: true });
@@ -1399,7 +1499,7 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
     pi.registerTool({
       name: "worktrunk",
       label: "Worktrunk",
-      description: `Run Worktrunk commands using the command reference generated from the installed binary. The command's remaining arguments pass directly to wt without shell expansion. Pi follows Worktrunk's directory-change directive, including from aliases and foreground hooks. Calls must be sequential: issue one Worktrunk call, wait for its result, then issue the next; a call made while another is still pending fails. Inspection commands return structured results immediately. In TUI/RPC, other commands return status queued and run after this turn. In codemode, end the script immediately on queued or stopped; do not run dependent tools until the continuation arrives. Command failures return status failed with diagnostics, not a thrown exception.${versionNotice}${referenceCatalog}${aliasCatalog}`,
+      description: `Run Worktrunk commands using the command reference generated from the installed binary. The command's remaining arguments pass directly to wt without shell expansion. Pi follows Worktrunk's directory-change directive, including from aliases and foreground hooks. If its working directory is gone, Pi recovers to a verified surviving worktree without running the requested command; re-evaluate the command there before retrying. Calls must be sequential: issue one Worktrunk call, wait for its result, then issue the next; a call made while another is still pending fails. Inspection commands return structured results immediately. In TUI/RPC, other commands return status queued and run after this turn. In codemode, end the script immediately on queued or stopped; do not run dependent tools until the continuation arrives. Command failures return status failed with diagnostics, not a thrown exception.${versionNotice}${referenceCatalog}${aliasCatalog}`,
       promptSnippet: "Run Worktrunk commands using the installed command, option, and example reference",
       promptGuidelines: [
         "Use worktrunk for Worktrunk commands. Select a command and its remaining arguments from the worktrunk reference and examples.",
@@ -1439,9 +1539,18 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
         signal?.throwIfAborted();
         invocationInFlight = true;
         try {
-          if (ctx.mode === "print" || ctx.mode === "json" || canRunInline(invocation, aliasNames.has(params.command))) {
-            const commonDir = await readCommonDir(ctx.cwd, signal);
-            const identity = commonDir ? repositoryIdentity(commonDir) : undefined;
+          const commonDir = await readCommonDir(ctx.cwd, signal);
+          signal?.throwIfAborted();
+          const identity = commonDir ? repositoryIdentity(commonDir) : undefined;
+          const usable = await usableWorktree(ctx.cwd, identity);
+          signal?.throwIfAborted();
+          if (!usable && (ctx.mode === "print" || ctx.mode === "json")) {
+            const target = await recoveryDestination(ctx.cwd);
+            ctx.abort();
+            return toolReply("stopped", args, ctx.cwd,
+              `Command not run: Pi's working directory is no longer usable. Restart Pi in ${target?.path ?? "a surviving worktree"}.`);
+          }
+          if (ctx.mode === "print" || ctx.mode === "json" || (usable && canRunInline(invocation, aliasNames.has(params.command)))) {
             let result: WtResult;
             try { result = await invoke(args, { cwd: ctx.cwd, signal }); }
             catch (error) {
@@ -1459,14 +1568,16 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
                 stopReason = `Worktrunk requested ${destination}. This tool call cannot move the session; restart Pi there.`;
               } else {
                 const current = await readCommonDir(ctx.cwd);
-                if (!current || !sameRepositoryIdentity(identity, repositoryIdentity(current))) {
+                if (!await usableWorktree(ctx.cwd, current ? repositoryIdentity(current) : undefined) ||
+                    (identity && !sameRepositoryIdentity(identity, current ? repositoryIdentity(current) : undefined))) {
                   stopReason = `Pi's working directory no longer exists or is not the original Git worktree: ${ctx.cwd}. Restart Pi in a surviving worktree.`;
                 }
               }
             } catch (error) {
               const message = error instanceof Error ? error.message : String(error);
               const current = await readCommonDir(ctx.cwd);
-              if (current && sameRepositoryIdentity(identity, repositoryIdentity(current))) {
+              if (await usableWorktree(ctx.cwd, current ? repositoryIdentity(current) : undefined) &&
+                  (!identity || sameRepositoryIdentity(identity, current ? repositoryIdentity(current) : undefined))) {
                 return toolReply("failed", args, ctx.cwd, [output, approval, message].filter(Boolean).join("\n\n"), result);
               }
               stopReason = message;
@@ -1538,6 +1649,9 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    recoveryState = undefined;
+    const commonDir = await readCommonDir(ctx.cwd, ctx.signal);
+    if (commonDir) await rememberWorktree(ctx.cwd, commonDir, await safeList(ctx.cwd, ctx.signal));
     await discoverCommandsAndAliases(ctx);
     registerTool();
     await tracker.markWaiting(ctx.cwd);
