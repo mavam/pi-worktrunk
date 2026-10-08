@@ -1,0 +1,9 @@
+created: 2026-10-08
+title: Session recovery after worktree removal
+intro: >-
+  Pi now recovers your session to a surviving worktree when its working directory
+  disappears. Recovery preserves your conversation without replaying commands against
+  the wrong branch.
+source:
+  mode: sync-stable-queue
+  previous_stable: v0.12.0
