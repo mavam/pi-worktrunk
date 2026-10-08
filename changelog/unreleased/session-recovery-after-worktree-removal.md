@@ -3,6 +3,8 @@ title: Session recovery after worktree removal
 type: bugfix
 authors:
   - mavam
+prs:
+  - 25
 created: 2026-10-08T17:36:09.744314Z
 ---
 
