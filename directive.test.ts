@@ -163,12 +163,13 @@ for (const scenario of [
         },
       });
       assert.equal(existsSync(source), true);
-      if (["land-placeholder", "subdirectory"].includes(scenario)) {
+      if (["land-placeholder", "subdirectory", "no-directive-placeholder"].includes(scenario)) {
         const destination = SessionManager.open(requested, join(root, "sessions"));
         assert.equal(destination.getCwd(), target);
         assert.equal(continuations.length, 1);
         const details = (destination.getEntries().at(-1) as any).details;
         assert.equal(details.target.branch, "main");
+        assert.equal(details.kind, scenario === "no-directive-placeholder" ? "recovery" : "move");
         assert.equal("trail" in details, false);
       } else if (scenario === "cancel-switch") {
         assert.ok(requested);
@@ -181,10 +182,6 @@ for (const scenario of [
           assert.match(notifications.join("\n"), /Rejected Worktrunk destination/);
           assert.equal(continuations.length, 1);
           assert.match(continuations[0].content, /Rejected Worktrunk destination/);
-        }
-        if (scenario === "no-directive-placeholder") {
-          assert.match(notifications.join("\n"), /no longer usable/);
-          assert.equal(continuations.length, 0);
         }
       }
     } finally {

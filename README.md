@@ -43,9 +43,20 @@ and requests the main worktree, Pi continues there without waiting for backgroun
 cleanup. Existing destination subdirectories are preserved.
 
 Pi follows a valid directive even if a later hook fails, and reports the failure
-in the destination session. Without a directive, Pi stays put: it doesn't infer
-a destination from newly created worktrees or session history. Each invocation
-uses a private temporary reply file, which is deleted afterward.
+in the destination session. Without a directive, Pi stays put as long as its
+working directory remains usable. Each invocation uses a private temporary
+reply file, which is deleted afterward.
+
+If the working directory has been removed, Pi recovers to a surviving worktree
+in the same repository, preferring the main worktree. This also works when
+another process deletes the worktree: the next `/wt` command or `worktrunk` tool
+call recovers the session instead of trying to launch Worktrunk there. Pi must
+have recorded the repository and its worktrees before removal.
+
+Recovery creates a linked session labeled **Session recovered**. A command
+requested after the directory became unusable is **not run**; review it in the
+new worktree before retrying. If a command removed the directory itself, Pi
+preserves its result and doesn't replay it.
 
 Each move creates a linked Pi session in the destination. The source session
 remains available through `/resume`.
@@ -150,8 +161,10 @@ than continue the script.
 ## 🛡️ Safety
 
 - Pi validates that a requested directory belongs to the original repository.
-- If the current directory becomes unusable without a valid directive, Pi stops
-  continuation rather than choosing a recovery destination.
+- Recovery only uses previously recorded worktrees whose repository identity
+  still matches. If none survive, or the session cannot move, Pi reports where
+  to restart or asks you to choose a surviving worktree.
+- Rejected directives and cancelled session moves never trigger a fallback move.
 - Worktrunk retains control of hooks, project-command approvals, dirty-worktree
   checks, force flags, branch deletion, and command errors.
 - Session movement preserves the source session.

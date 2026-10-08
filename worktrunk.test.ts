@@ -418,7 +418,7 @@ test("non-interactive tools run Worktrunk before the session exits", async () =>
   } finally {
     await rm(removedCwd, { recursive: true, force: true });
   }
-  assert.deepEqual(calls, [["list"], ["step", "promote", "feature"], ["list"], ["step", "promote", "feature"], ["switch", "--no-cd", "feature"], ["list", "--large"], ["remove", "current"]]);
+  assert.deepEqual(calls, [["--config-set", "list.json-schema=2", "list", "--format=json"], ["list"], ["step", "promote", "feature"], ["list"], ["step", "promote", "feature"], ["switch", "--no-cd", "feature"], ["list", "--large"], ["remove", "current"]]);
   assert.deepEqual(sent, []);
 });
 
