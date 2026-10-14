@@ -1,0 +1,9 @@
+created: 2026-10-14
+title: Terminal follows the active worktree
+intro: >-
+  Pi now reports the active worktree directory to your terminal, so new tabs and splits
+  can open in the right worktree. When Pi exits, it restores the launch directory
+  report.
+source:
+  mode: sync-stable-queue
+  previous_stable: v0.12.1
