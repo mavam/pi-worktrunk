@@ -61,6 +61,13 @@ preserves its result and doesn't replay it.
 Each move creates a linked Pi session in the destination. The source session
 remains available through `/resume`.
 
+In the TUI, Pi also reports the session's directory to your terminal (OSC 7),
+so tabs and splits you open manually can start in the active worktree. When Pi
+exits, it reports the directory it was launched from again. Whether new tabs
+use the reported directory depends on your terminal: Ghostty and WezTerm do by
+default, while kitty needs `--cwd=last_reported`. tmux keeps the report for
+its own pane instead of forwarding it to the outer terminal.
+
 ### 🏷️ Worktrunk aliases
 
 Your configured aliases pass directly through `/wt`. For example, if you define

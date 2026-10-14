@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { existsSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { basename, resolve, join, isAbsolute } from "node:path";
+import { pathToFileURL } from "node:url";
 
 import {
   SessionManager,
@@ -954,7 +955,46 @@ function renderWorktrunkOutput(output: string, expanded: boolean, isError: boole
   return new Text(text, 0, 0);
 }
 
-export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedWt) {
+export type TerminalStream = { isTTY?: boolean; write(data: string): unknown };
+
+// OSC 7 reports the working directory to the terminal so that manually opened
+// tabs and splits can inherit it. Windows terminals use different sequences.
+export function formatTerminalCwd(cwd: string, host = hostname()): string {
+  const url = pathToFileURL(cwd);
+  // Hosts that are not valid URL authorities leave the authority empty.
+  url.hostname = host;
+  return `\x1b]7;${url.href}\x07`;
+}
+
+export function createTerminalCwdReporter(
+  stream: TerminalStream = process.stdout,
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+) {
+  let launchCwd: string | undefined;
+  try { launchCwd = process.cwd(); } catch { /* Launch directory is already gone. */ }
+  const enabled = (ctx: Pick<ExtensionContext, "mode" | "hasUI">) =>
+    ctx.mode === "tui" && ctx.hasUI && stream.isTTY === true && env.TERM !== "dumb" && platform !== "win32";
+  const report = (cwd: string) => {
+    try { stream.write(formatTerminalCwd(cwd)); } catch { /* Reporting is best-effort. */ }
+  };
+  return {
+    publish(ctx: Pick<ExtensionContext, "mode" | "hasUI" | "cwd">) {
+      if (enabled(ctx)) report(ctx.cwd);
+    },
+    // Session replacement shuts down the old session before starting the new
+    // one; only restore the launch directory when Pi actually exits.
+    restore(ctx: Pick<ExtensionContext, "mode" | "hasUI">, reason: string) {
+      if (reason === "quit" && launchCwd && enabled(ctx)) report(launchCwd);
+    },
+  };
+}
+
+export default function extension(
+  pi: ExtensionAPI,
+  invoke: RunWt = runDirectedWt,
+  terminal = createTerminalCwdReporter(),
+) {
   pi.registerEntryRenderer<CommandDisplay>(COMMAND_ENTRY_TYPE, (entry, { expanded }, theme) => {
     if (!entry.data) return undefined;
     const { args, output, isError } = entry.data;
@@ -1649,6 +1689,7 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    terminal.publish(ctx);
     recoveryState = undefined;
     const commonDir = await readCommonDir(ctx.cwd, ctx.signal);
     if (commonDir) await rememberWorktree(ctx.cwd, commonDir, await safeList(ctx.cwd, ctx.signal));
@@ -1661,8 +1702,9 @@ export default function extension(pi: ExtensionAPI, invoke: RunWt = runDirectedW
     blockToolCalls = false;
     return tracker.markWaiting(ctx.cwd);
   });
-  pi.on("session_shutdown", (_event, ctx) => {
+  pi.on("session_shutdown", (event, ctx) => {
     blockToolCalls = false;
+    terminal.restore(ctx, event.reason);
     return tracker.clear(ctx.cwd);
   });
 }
