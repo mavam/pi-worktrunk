@@ -1,0 +1,9 @@
+created: 2026-10-23
+title: Smaller tool description with on-demand help
+intro: >-
+  The worktrunk tool description is now about 90% smaller, listing only commands,
+  options, and aliases. Agents look up any command's full reference on demand by adding
+  --help to its arguments.
+source:
+  mode: sync-stable-queue
+  previous_stable: v0.12.2
