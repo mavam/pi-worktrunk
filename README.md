@@ -114,10 +114,19 @@ remaining arguments directly to `wt` without shell expansion:
 { "command": "switch", "args": ["--create", "fix/parser"] }
 ```
 
-At startup, the extension generates the tool reference from the installed
-Worktrunk binary. The description therefore matches its command tree, options,
-arguments, and examples without requiring a matching pi-worktrunk release.
-Repository aliases are discovered at the same time. Agent calls run without an
+At startup, the extension generates a compact command catalog from the installed
+Worktrunk binary and discovers repository aliases. The tool description lists
+only commands, global options, and aliases, so it stays small. The agent looks
+up a command's arguments, options, subcommands, and examples on demand by adding
+`--help` to its args:
+
+```json
+{ "command": "step", "args": ["commit", "--help"] }
+```
+
+Help calls return immediately, also in TUI or RPC mode, and the reference
+matches the installed binary without requiring a matching pi-worktrunk release.
+Agent calls run without an
 additional Pi confirmation. Commands that move to another worktree stop the old
 model turn, switch to a linked session, report Worktrunk's result, and resume the
 task there.
@@ -137,7 +146,9 @@ text(result.data ?? result.output);
 
 Results include `status`, `args`, `cwd`, `output`, and `truncated`. Executed
 commands also include `code`. When stdout is a JSON object or array within the
-output limit, it is available as `data`; otherwise use `output`. Command
+output limit, it is available as `data`; otherwise use `output`. For help
+calls, `data` holds the command reference with `command`, `summary`, `usage`,
+`arguments`, `options`, `subcommands`, and `examples`. Command
 failures return `status: "failed"` with diagnostics. Invalid arguments, blocked
 calls, and overlapping calls still throw.
 

@@ -10,10 +10,11 @@ import { createAgentSession, ModelRuntime, SessionManager } from "@earendil-work
 
 import registerExtension, {
   MARKERS,
-  buildReference,
   createMarkerUpdater,
   createWorktrunkClient,
-  formatReference,
+  formatCatalog,
+  formatCommandHelp,
+  helpRequest,
   markerArgs,
   parseAliasArguments,
   parseCommand,
@@ -21,6 +22,7 @@ import registerExtension, {
   parseWorktrunkAliases,
   parseWorktrunkCommands,
   renderToolExample,
+  resolveCommandHelp,
   splitShell,
 } from "./worktrunk.ts";
 
@@ -160,49 +162,81 @@ test("subcommands preserve wrapped summaries and parent fallbacks", () => {
   assert.equal(fallback.summary, "Run pre-switch hooks");
 });
 
-test("reference generation recursively discovers every Markdown help command", async () => {
-  const rootOutput = "wt - Worktree manager\n\nCommands:\n  config  Manage configuration\n";
+test("the catalog lists commands and trimmed global options without -y", () => {
+  const catalog = formatCatalog([
+    "wt - Worktree manager",
+    "",
+    "Commands:",
+    "  switch  Switch worktrees",
+    "  step    Run individual operations",
+    "",
+    "Global Options:",
+    "  -C <path>",
+    "          Working directory for this command",
+    "",
+    "  -v, --verbose...",
+    "          Verbose output. Set WORKTRUNK_VERBOSE to apply it everywhere",
+    "",
+    "  -y, --yes",
+    "          Skip approval prompts",
+  ].join("\n"));
+  assert.match(catalog, /^## Commands\n- `switch`: Switch worktrees\n- `step`: Run individual operations/);
+  assert.match(catalog, /- `-C <path>`: Working directory for this command/);
+  assert.match(catalog, /- `-v, --verbose...`: Verbose output\.$/);
+  assert.doesNotMatch(catalog, /WORKTRUNK_VERBOSE|--yes/);
+  assert.equal(formatCatalog("wt - Worktree manager\n"), "");
+});
+
+test("help requests stop at the argument separator", () => {
+  assert.deepEqual(helpRequest(parseWtInvocation("step commit --help")), ["step", "commit"]);
+  assert.deepEqual(helpRequest(parseWtInvocation("-C repo switch -h")), ["switch"]);
+  assert.equal(helpRequest(parseWtInvocation("step for-each -- ls -h")), undefined);
+  assert.equal(helpRequest(parseWtInvocation("switch main")), undefined);
+});
+
+test("help resolves the deepest known subcommand and renders structured data", async () => {
   const outputs = new Map([
     ["config", "wt config - Manage configuration\n\nCommands:\n  plugins  Plugin management\n"],
     ["config plugins", [
-      "wt config plugins - Plugin management",
+      "wt config plugins",
+      "",
+      "Usage: wt config plugins <COMMAND>",
       "",
       "Commands:",
       "  claude  Claude Code plugin",
       "",
+      "Options:",
+      "      --format <FORMAT>",
+      "          Output format",
+      "",
       "## Examples",
       "```console",
       "$ wt config plugins claude install",
+      "$ git status",
       "```",
     ].join("\n")],
-    ["config plugins claude", "wt config plugins claude - Claude Code plugin\n\nCommands:\n  install  Install the plugin\n"],
-    ["config plugins claude install", "wt config plugins claude install - Install the plugin\n\nUsage: wt config plugins claude install\n"],
   ]);
   const calls: string[] = [];
-  const reference = await buildReference(
-    parseWorktrunkCommands(rootOutput),
-    rootOutput,
-    async (path) => { calls.push(path.join(" ")); return outputs.get(path.join(" ")); },
-  );
-  assert.deepEqual(calls, [...outputs.keys()]);
-  assert.match(reference, /config plugins claude install — Install the plugin/);
-  assert.match(reference, /\{"command":"config","args":\["plugins","claude","install"\]\}/);
-});
-
-test("reference generation stays within the size cap", () => {
-  const rootOutput = "Commands:\n  switch  Switch worktrees\n";
-  const root = parseCommand([], rootOutput);
-  const command = parseCommand(["switch"], "", "Switch worktrees");
-  command.options = [{
-    syntax: "--verbose-help",
-    description: `Short description. ${"Long option details ".repeat(2_000)}`,
-  }];
-  command.examples = [["switch", "main"]];
-  const reference = formatReference(root, [command], rootOutput);
-  assert.ok(Buffer.byteLength(reference) <= 30_000);
-  assert.match(reference, /Short description\./);
-  assert.doesNotMatch(reference, /Long option details/);
-  assert.match(reference, /\{"command":"switch","args":\["main"\]\}/);
+  const help = await resolveCommandHelp(["config", "plugins", "--format", "json"], new Set(["config"]), async (path) => {
+    calls.push(path.join(" "));
+    return outputs.get(path.join(" "))!;
+  });
+  assert.deepEqual(calls, ["config", "config plugins"]);
+  assert.deepEqual(help, {
+    command: ["config", "plugins"],
+    summary: "Plugin management",
+    usage: "wt config plugins <COMMAND>",
+    arguments: [],
+    options: [{ syntax: "--format <FORMAT>", description: "Output format" }],
+    subcommands: [{ name: "claude", description: "Claude Code plugin" }],
+    examples: [{ command: "config", args: ["plugins", "claude", "install"] }],
+  });
+  const text = formatCommandHelp(help);
+  assert.match(text, /^# wt config plugins\n\nPlugin management\n\nUsage: `wt config plugins <COMMAND>`/);
+  assert.match(text, /## Options\n- `--format <FORMAT>`: Output format/);
+  assert.match(text, /## Subcommands\n- `claude`: Claude Code plugin/);
+  assert.match(text, /\{"command":"config","args":\["plugins","claude","--help"\]\}/);
+  assert.match(text, /## Examples\n- `\{"command":"config","args":\["plugins","claude","install"\]\}`/);
 });
 
 test("markers map Pi state to Worktrunk", async () => {
@@ -253,7 +287,7 @@ test("tool registers synchronously before repository-specific discovery", async 
         "  doctor  Diagnose setup",
       ].join("\n") };
       if (args.join(" ") === "--version") return { code: 0, stdout: "wt v-next\n" };
-      if (args.join(" ") === "switch --help-md") return { code: 0, stdout: switchHelpMarkdown };
+      if (args.join(" ") === "switch --help-md") throw new Error("startup must not read subcommand help");
       if (args.join(" ") === "config show --format=json") return { code: 0, stdout: JSON.stringify({
         project: { config: { aliases: { land: [{ "merge-pr": "x" }, { verify: "x" }, { cleanup: "x" }], deploy: "x" } } },
       }) };
@@ -272,15 +306,14 @@ test("tool registers synchronously before repository-specific discovery", async 
     "switch", "doctor", "land", "deploy",
   ]);
   assert.match(tool.parameters.properties.args.description, /Arguments after the Worktrunk command/);
-  assert.match(tool.description, /Worktrunk command reference/);
-  assert.match(tool.description, /switch — Switch to a worktree; create if needed/);
-  assert.match(tool.description, /- -c, --create: Create a new branch/);
-  assert.match(tool.description, /\{"command":"switch","args":\["--create","new-feature"\]\}/);
-  assert.match(tool.description, /Reference generated from installed wt v-next/);
+  assert.match(tool.description, /## Commands\n- `switch`: Switch worktrees\n- `doctor`: Diagnose setup/);
+  assert.doesNotMatch(tool.description, /--create/);
+  assert.match(tool.description, /\{"command":"<command>","args":\["<subcommand>","--help"\]\}/);
+  assert.match(tool.description, /Catalog generated from installed wt v-next/);
   assert.match(tool.description, /land: merge-pr -> verify -> cleanup/);
   assert.match(tool.description, /Example: \{"command":"deploy","args":\[\]\}/);
-  assert.match(tool.promptSnippet, /installed command, option, and example reference/);
-  assert.ok(tool.promptGuidelines.some((guideline: string) => guideline.includes("reference and examples")));
+  assert.match(tool.promptSnippet, /add --help to args/);
+  assert.ok(tool.promptGuidelines.some((guideline: string) => guideline.includes("--help")));
   assert.equal(tool.prepareArguments, undefined);
   assert.deepEqual(commands.get("wt").getArgumentCompletions("sw"), [
     { value: "switch", label: "switch" },
@@ -304,7 +337,7 @@ test("missing Worktrunk keeps the generic startup tool", async () => {
   const tool = tools.get("worktrunk");
   assert.equal(tool.parameters.properties.command.type, "string");
   assert.equal(tool.parameters.properties.command.enum, undefined);
-  assert.doesNotMatch(tool.description, /Worktrunk command reference/);
+  assert.doesNotMatch(tool.description, /## Commands/);
 });
 
 test("tool queues aliases without confirmation", async () => {
@@ -598,6 +631,64 @@ test("model list bypasses the picker and receives Worktrunk output", async () =>
     assert.deepEqual(sent, []);
     assert.deepEqual(messages, []);
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("model help runs inline, returns structured data, and is cached", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-help-"));
+  const source = join(root, "repo");
+  await mkdir(join(source, ".git"), { recursive: true });
+  const handlers = new Map<string, any>();
+  const commands = new Map<string, any>();
+  const tools = new Map<string, any>();
+  const sent: Array<{ text: string; options: any }> = [];
+  const calls: string[] = [];
+  try {
+    extension(baseApi({ handlers, commands, tools, sent, async exec(program, args) {
+      if (program === "git") return { code: 0, stdout: `${join(source, ".git")}\n` };
+      calls.push(args.join(" "));
+      if (args[0] === "--help-md") return { code: 0, stdout: "Commands:\n  switch  Switch worktrees\n" };
+      if (args.join(" ") === "switch --help-md") return { code: 0, stdout: switchHelpMarkdown };
+      if (args.join(" ") === "switch bogus --help-md") throw new Error("help must stop at known subcommands");
+      if (args.includes("list")) return { code: 0, stdout: wtList(source) };
+      return { code: 0, stdout: "" };
+    } }));
+    const manager = SessionManager.create(source, join(root, "sessions"));
+    manager.appendSessionInfo("test");
+    await handlers.get("session_start")({}, { cwd: source, sessionManager: manager });
+    const context = { cwd: source, mode: "tui", hasUI: true, ui: {} };
+    const tool = tools.get("worktrunk");
+    const result = await tool.execute("call", { command: "switch", args: ["bogus", "--help"] }, undefined, undefined, context);
+    assert.equal(result.terminate, undefined);
+    assert.equal(result.structuredContent.status, "completed");
+    assert.deepEqual(result.structuredContent.data.command, ["switch"]);
+    assert.deepEqual(result.structuredContent.data.examples[0], { command: "switch", args: ["--create", "new-feature"] });
+    assert.match(result.content[0].text, /## Options\n- `-c, --create`: Create a new branch/);
+    assert.notDeepEqual(tool.renderResult(result, {}, { fg: (_: string, text: string) => text, bold: (text: string) => text }, { isError: false }).render(100), []);
+    await tool.execute("again", { command: "switch", args: ["-h"] }, undefined, undefined, context);
+    assert.equal(calls.filter((call) => call === "switch --help-md").length, 1);
+    assert.deepEqual(sent, []);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("model help reports failures without queueing", async () => {
+  const handlers = new Map<string, any>();
+  const commands = new Map<string, any>();
+  const tools = new Map<string, any>();
+  const sent: Array<{ text: string; options: any }> = [];
+  extension(baseApi({ handlers, commands, tools, sent, async exec(program, args) {
+    if (program === "git") return { code: 1, stdout: "", stderr: "" };
+    if (args[0] === "--help-md") return { code: 0, stdout: "Commands:\n  switch  Switch worktrees\n" };
+    if (args.join(" ") === "switch --help-md") return { code: 2, stdout: "", stderr: "unexpected help failure" };
+    return { code: 0, stdout: "" };
+  } }));
+  await handlers.get("session_start")({}, { cwd: process.cwd(), signal: undefined, sessionManager: { getEntries: () => [] } });
+  const result = await tools.get("worktrunk").execute("call", { command: "switch", args: ["--help"] }, undefined, undefined, {
+    cwd: process.cwd(), mode: "tui", hasUI: true, ui: {},
+  });
+  assert.equal(result.isError, true);
+  assert.equal(result.structuredContent.status, "failed");
+  assert.match(result.structuredContent.output, /unexpected help failure/);
+  assert.deepEqual(sent, []);
 });
 
 test("JSON mode runs exact argv without replacing the session", async () => {

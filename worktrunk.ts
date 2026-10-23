@@ -168,10 +168,8 @@ const CONTINUATION_MESSAGE_TYPE = "pi-worktrunk-continuation";
 const MAX_CONTINUATION_OUTPUT = 50_000;
 const CONTINUATION_ARG_PREFIX = "__pi_worktrunk_continuation=";
 const WORKTRUNK_ALIAS_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
-const MAX_REFERENCE_BYTES = 30_000;
-const MAX_EXAMPLES_PER_COMMAND = 3;
+const MAX_EXAMPLES_PER_COMMAND = 5;
 const HELP_DESCRIPTION_INDENT = 10;
-const HELP_PROBE_CONCURRENCY = 8;
 const HELP_PROBE_TIMEOUT_MS = 10_000;
 
 class WorktrunkError extends Error {
@@ -492,178 +490,120 @@ export function parseExamples(output: string): string[][] {
   return examples;
 }
 
-function attributeExamples(commands: CommandReference[]): void {
-  const examples = commands.flatMap((command) => command.examples);
-  for (const command of commands) command.examples = [];
-  const candidates = [...commands].sort((left, right) => right.path.length - left.path.length);
-  for (const tokens of examples) {
-    const command = candidates.find(({ path }) => tokens.some((_, start) =>
-      path.every((part, index) => tokens[start + index] === part)));
-    if (!command) continue;
-    const key = JSON.stringify(tokens);
-    if (!command.examples.some((example) => JSON.stringify(example) === key)) {
-      command.examples.push(tokens);
-    }
-  }
+export type ToolExample = { command: string; args: string[] };
+export type CommandHelp = {
+  command: string[];
+  summary: string;
+  usage: string;
+  arguments: ReferenceEntry[];
+  options: ReferenceEntry[];
+  subcommands: { name: string; description: string }[];
+  examples: ToolExample[];
+};
+
+export function toolExample(
+  tokens: readonly string[],
+  topLevelCommands: ReadonlySet<string>,
+): ToolExample | undefined {
+  const commandIndex = tokens.findIndex((token) => topLevelCommands.has(token));
+  if (commandIndex < 0) return undefined;
+  return {
+    command: tokens[commandIndex],
+    args: [...tokens.slice(0, commandIndex), ...tokens.slice(commandIndex + 1)],
+  };
 }
 
 export function renderToolExample(
   tokens: readonly string[],
   topLevelCommands: ReadonlySet<string>,
 ): string | undefined {
-  const commandIndex = tokens.findIndex((token) => topLevelCommands.has(token));
-  if (commandIndex < 0) return undefined;
-  return JSON.stringify({
-    command: tokens[commandIndex],
-    args: [...tokens.slice(0, commandIndex), ...tokens.slice(commandIndex + 1)],
-  });
+  const example = toolExample(tokens, topLevelCommands);
+  return example ? JSON.stringify(example) : undefined;
 }
 
 function firstSentence(description: string): string {
   return description.match(/^.*?[.!?](?=\s+[A-Z]|\s*$)/)?.[0] ?? description;
 }
 
-function truncateReference(reference: string): string {
-  const suffix = "\n[reference truncated]";
-  const limit = MAX_REFERENCE_BYTES - Buffer.byteLength(suffix);
-  const codePoints = [...reference];
-  let low = 0;
-  let high = codePoints.length;
-  while (low < high) {
-    const middle = Math.ceil((low + high) / 2);
-    if (Buffer.byteLength(codePoints.slice(0, middle).join("")) <= limit) low = middle;
-    else high = middle - 1;
-  }
-  let result = codePoints.slice(0, low).join("");
-  const newline = result.lastIndexOf("\n");
-  if (newline > 0) result = result.slice(0, newline);
-  return `${result}${suffix}`;
+function helpCall(path: readonly string[]): string {
+  return JSON.stringify({ command: path[0], args: [...path.slice(1), "--help"] });
 }
 
-function renderReference(
-  root: CommandReference,
-  all: readonly CommandReference[],
-  rootOutput: string,
-  trimOptions: boolean,
-  includeExamples: boolean,
-): string {
-  const lines = ["Worktrunk command reference"];
-  const topLevelCommands = new Set(root.subcommands.map(({ syntax }) => syntax));
-  const globalOptions = parseSectionEntries(rootOutput, new Set(["Options", "Global Options"]), "option");
+/** Compact catalog for the tool description; details are disclosed through `--help`. */
+export function formatCatalog(rootOutput: string): string {
+  const commands = parseCommands(rootOutput);
+  if (!commands.length) return "";
+  const lines = ["## Commands"];
+  for (const { syntax, description } of commands) lines.push(`- \`${syntax}\`: ${description}`);
+  // The tool rejects -y/--yes, so do not advertise it.
+  const globalOptions = parseSectionEntries(rootOutput, new Set(["Options", "Global Options"]), "option")
+    .filter(({ syntax }) => !/(?:^|, )(?:-y|--yes)(?:\s|,|$)/.test(syntax));
   if (globalOptions.length) {
-    lines.push("", "Global options:");
-    for (const option of globalOptions) {
-      lines.push(`- ${option.syntax}: ${trimOptions ? firstSentence(option.description) : option.description}`);
-    }
-  }
-  for (const command of all) {
-    lines.push("", `${command.path.join(" ")} — ${command.summary}`);
-    if (command.path.length === 1) lines.push(`Usage: ${command.usage}`);
-    if (command.subcommands.length) {
-      lines.push("Subcommands:");
-      for (const subcommand of command.subcommands) lines.push(`- ${subcommand.syntax}: ${subcommand.description}`);
-    }
-    if (command.arguments.length) {
-      lines.push("Arguments:");
-      for (const argument of command.arguments) lines.push(`- ${argument.syntax}: ${argument.description}`);
-    }
-    if (command.options.length) {
-      lines.push("Options:");
-      for (const option of command.options) {
-        lines.push(`- ${option.syntax}: ${trimOptions ? firstSentence(option.description) : option.description}`);
-      }
-    }
-    if (!includeExamples) continue;
-    const examples = command.examples.flatMap((tokens) => {
-      const example = renderToolExample(tokens, topLevelCommands);
-      return example ? [example] : [];
-    }).slice(0, MAX_EXAMPLES_PER_COMMAND);
-    if (examples.length) {
-      lines.push("Examples:");
-      for (const example of examples) lines.push(`- ${example}`);
-    }
+    lines.push("", "## Global options");
+    for (const { syntax, description } of globalOptions) lines.push(`- \`${syntax}\`: ${firstSentence(description)}`);
   }
   return lines.join("\n");
 }
 
-export function formatReference(
-  root: CommandReference,
-  all: readonly CommandReference[],
-  rootOutput: string,
-): string {
-  let reference = renderReference(root, all, rootOutput, false, true);
-  if (Buffer.byteLength(reference) <= MAX_REFERENCE_BYTES) return reference;
-  reference = renderReference(root, all, rootOutput, true, true);
-  if (Buffer.byteLength(reference) <= MAX_REFERENCE_BYTES) return reference;
-  reference = renderReference(root, all, rootOutput, true, false);
-  return Buffer.byteLength(reference) <= MAX_REFERENCE_BYTES
-    ? reference
-    : truncateReference(reference);
+/** Tokens naming the command whose help a tool call requests, if any. */
+export function helpRequest(invocation: Pick<Invocation, "command" | "commandArgs">): string[] | undefined {
+  if (!invocation.command) return undefined;
+  const separator = invocation.commandArgs.indexOf("--");
+  const args = separator < 0 ? invocation.commandArgs : invocation.commandArgs.slice(0, separator);
+  const index = args.findIndex((arg) => arg === "--help" || arg === "-h");
+  return index < 0 ? undefined : [invocation.command, ...args.slice(0, index)];
 }
 
-async function mapConcurrent<T, R>(
-  items: readonly T[],
-  worker: (item: T) => Promise<R>,
-): Promise<R[]> {
-  const results = new Array<R>(items.length);
-  let next = 0;
-  await Promise.all(Array.from(
-    { length: Math.min(HELP_PROBE_CONCURRENCY, items.length) },
-    async () => {
-      while (next < items.length) {
-        const index = next;
-        next += 1;
-        results[index] = await worker(items[index]);
-      }
-    },
-  ));
-  return results;
-}
-
-export async function buildReference(
-  commands: readonly WorktrunkCommand[],
-  rootOutput: string,
-  readCommand: (path: readonly string[]) => Promise<string | undefined>,
-): Promise<string> {
-  type PendingCommand = { path: string[]; summary: string };
-  const references = new Map<string, CommandReference>();
-  const requested = new Set<string>();
-  let pending: PendingCommand[] = commands.map(({ name, description }) => ({
-    path: [name],
-    summary: description,
-  }));
-
-  while (pending.length) {
-    for (const { path } of pending) requested.add(path.join("\0"));
-    const outputs = await mapConcurrent(pending, async ({ path }) => {
-      try { return await readCommand(path); } catch { return undefined; }
-    });
-    const next: PendingCommand[] = [];
-    for (let index = 0; index < pending.length; index += 1) {
-      const output = outputs[index];
-      if (!output?.trim()) continue;
-      const current = pending[index];
-      const command = parseCommand(current.path, output, current.summary);
-      references.set(current.path.join("\0"), command);
-      for (const subcommand of command.subcommands) {
-        const path = [...current.path, subcommand.syntax];
-        const key = path.join("\0");
-        if (!requested.has(key)) next.push({ path, summary: subcommand.description });
-      }
-    }
-    pending = next;
+/** Resolve the deepest known subcommand in `tokens` and describe it. */
+export async function resolveCommandHelp(
+  tokens: readonly string[],
+  topLevelCommands: ReadonlySet<string>,
+  readCommand: (path: readonly string[]) => Promise<string>,
+): Promise<CommandHelp> {
+  let path = [tokens[0]];
+  let command = parseCommand(path, await readCommand(path));
+  for (const token of tokens.slice(1)) {
+    const subcommand = command.subcommands.find(({ syntax }) => syntax === token);
+    if (!subcommand) break;
+    path = [...path, token];
+    command = parseCommand(path, await readCommand(path), subcommand.description);
   }
-
-  const all: CommandReference[] = [];
-  const append = (path: string[]) => {
-    const command = references.get(path.join("\0"));
-    if (!command) return;
-    all.push(command);
-    for (const subcommand of command.subcommands) append([...path, subcommand.syntax]);
+  return {
+    command: path,
+    summary: command.summary,
+    usage: command.usage,
+    arguments: command.arguments,
+    options: command.options,
+    subcommands: command.subcommands.map(({ syntax, description }) => ({ name: syntax, description })),
+    examples: command.examples
+      .flatMap((example) => toolExample(example, topLevelCommands) ?? [])
+      .slice(0, MAX_EXAMPLES_PER_COMMAND),
   };
-  for (const { name } of commands) append([name]);
-  attributeExamples(all);
-  return formatReference(parseCommand([], rootOutput), all, rootOutput);
+}
+
+export function formatCommandHelp(help: CommandHelp): string {
+  const lines = [`# wt ${help.command.join(" ")}`];
+  if (help.summary) lines.push("", help.summary);
+  lines.push("", `Usage: \`${help.usage}\``);
+  const section = (title: string, entries: readonly ReferenceEntry[]) => {
+    if (!entries.length) return;
+    lines.push("", `## ${title}`);
+    for (const { syntax, description } of entries) {
+      lines.push(description ? `- \`${syntax}\`: ${description}` : `- \`${syntax}\``);
+    }
+  };
+  section("Arguments", help.arguments);
+  section("Options", help.options);
+  if (help.subcommands.length) {
+    lines.push("", "## Subcommands");
+    for (const { name, description } of help.subcommands) lines.push(`- \`${name}\`: ${description}`);
+    lines.push("", `Look up a subcommand with \`${helpCall([...help.command, help.subcommands[0].name])}\`.`);
+  }
+  if (help.examples.length) {
+    lines.push("", "## Examples");
+    for (const example of help.examples) lines.push(`- \`${JSON.stringify(example)}\``);
+  }
+  return lines.join("\n");
 }
 
 export function parseWorktrunkCommands(output: string): WorktrunkCommand[] {
@@ -817,16 +757,16 @@ const WorktrunkOutput = Type.Object({
   code: Type.Optional(Type.Integer({ description: "Worktrunk exit code; absent for queued commands." })),
   output: Type.String({ description: "Bounded command output, including failure and continuation guidance." }),
   truncated: Type.Boolean(),
-  data: Type.Optional(Type.Unknown({ description: "Parsed stdout JSON object or array, when valid and within the output limit." })),
+  data: Type.Optional(Type.Unknown({ description: "Parsed stdout JSON object or array, when valid and within the output limit; the command reference for --help calls." })),
 }, { additionalProperties: false });
 
 function toolReply(
   status: "completed" | "failed" | "queued" | "stopped",
-  args: string[], cwd: string, text: string, result?: WtResult,
+  args: string[], cwd: string, text: string, result?: WtResult, structured?: object,
 ): AgentToolResult<{ args: string[]; code?: number }> {
   const output = boundedModelOutput(text);
-  let data: any;
-  if (result?.stdout && result.stdout.length <= MAX_CONTINUATION_OUTPUT) {
+  let data: any = structured;
+  if (data === undefined && result?.stdout && result.stdout.length <= MAX_CONTINUATION_OUTPUT) {
     try {
       const parsed = JSON.parse(result.stdout);
       // Scalars such as `42` or `true` are plain values; `output` already carries them.
@@ -1021,9 +961,10 @@ export default function extension(
 
   const execWt: RunWt = (args, options) => pi.exec("wt", args, options);
   let aliases: WorktrunkAlias[] = [];
-  let installedCommands: WorktrunkCommand[] = [];
   let installedVersion: string | undefined;
-  let worktrunkReference = "";
+  let worktrunkCatalog = "";
+  // Help depends only on the installed binary; discovery clears it.
+  const helpCache = new Map<string, Promise<string>>();
   let pendingContinuation: PendingContinuation | undefined;
   let placementInFlight = false;
   let invocationInFlight = false;
@@ -1117,9 +1058,9 @@ export default function extension(
 
   async function discoverCommandsAndAliases(ctx: ExtensionContext) {
     aliases = [];
-    installedCommands = [];
     installedVersion = undefined;
-    worktrunkReference = "";
+    worktrunkCatalog = "";
+    helpCache.clear();
     commandNames.clear();
     aliasNames.clear();
     let help: WtResult;
@@ -1132,32 +1073,36 @@ export default function extension(
     } catch { return; }
     if (help.code !== 0) return;
     const rootOutput = help.stdout ?? "";
-    installedCommands = parseWorktrunkCommands(rootOutput);
-    for (const { name } of installedCommands) commandNames.add(name);
+    for (const { name } of parseWorktrunkCommands(rootOutput)) commandNames.add(name);
 
-    const [version, reference, settings] = await Promise.all([
+    const [version, settings] = await Promise.all([
       runWt(["--version"], {
         cwd: ctx.cwd,
         signal: ctx.signal,
         timeout: HELP_PROBE_TIMEOUT_MS,
       }).catch(() => undefined),
-      buildReference(installedCommands, rootOutput, async (path) => {
-        const help = await runWt(
-          [...path, "--help-md"],
-          {
-            cwd: ctx.cwd,
-            signal: ctx.signal,
-            timeout: HELP_PROBE_TIMEOUT_MS,
-          },
-        );
-        return help.code === 0 && help.stdout?.trim() ? help.stdout : undefined;
-      }).catch(() => ""),
       client.settings(ctx.cwd, ctx.signal).catch(() => undefined),
     ]);
     if (version?.code === 0) installedVersion = version.stdout?.trim();
-    worktrunkReference = reference;
+    worktrunkCatalog = formatCatalog(rootOutput);
     if (settings !== undefined) aliases = parseWorktrunkAliases(settings);
     for (const { name } of aliases) aliasNames.add(name);
+  }
+  function commandHelp(tokens: string[], cwd: string, signal?: AbortSignal): Promise<CommandHelp> {
+    return resolveCommandHelp(tokens, commandNames, (path) => {
+      const key = path.join("\0");
+      let cached = helpCache.get(key);
+      if (!cached) {
+        const args = [...path, "--help-md"];
+        cached = runWt(args, { cwd, signal, timeout: HELP_PROBE_TIMEOUT_MS }).then((result) => {
+          if (result.code !== 0 || !result.stdout?.trim()) throw new WorktrunkError(formatWtFailure(args, result, cwd));
+          return result.stdout;
+        });
+        helpCache.set(key, cached);
+        cached.catch(() => helpCache.delete(key));
+      }
+      return cached;
+    });
   }
   function emit(ctx: ExtensionCommandContext, message: string, level: "info" | "warning" | "error") {
     if (ctx.mode === "print") process.stdout.write(`${message}\n`);
@@ -1528,9 +1473,9 @@ export default function extension(
       : "";
     const commandChoices = [...new Set([...commandNames, ...aliasNames])];
     const versionNotice = installedVersion
-      ? ` Reference generated from installed ${installedVersion}.`
+      ? ` Catalog generated from installed ${installedVersion}.`
       : "";
-    const referenceCatalog = worktrunkReference ? `\n\n${worktrunkReference}` : "";
+    const referenceCatalog = worktrunkCatalog ? `\n\n${worktrunkCatalog}` : "";
     const commandSchema = commandChoices.length
       ? StringEnum(commandChoices, {
         description: "Built-in Worktrunk command or configured alias to run.",
@@ -1539,10 +1484,10 @@ export default function extension(
     pi.registerTool({
       name: "worktrunk",
       label: "Worktrunk",
-      description: `Run Worktrunk commands using the command reference generated from the installed binary. The command's remaining arguments pass directly to wt without shell expansion. Pi follows Worktrunk's directory-change directive, including from aliases and foreground hooks. If its working directory is gone, Pi recovers to a verified surviving worktree without running the requested command; re-evaluate the command there before retrying. Calls must be sequential: issue one Worktrunk call, wait for its result, then issue the next; a call made while another is still pending fails. Inspection commands return structured results immediately. In TUI/RPC, other commands return status queued and run after this turn. In codemode, end the script immediately on queued or stopped; do not run dependent tools until the continuation arrives. Command failures return status failed with diagnostics, not a thrown exception.${versionNotice}${referenceCatalog}${aliasCatalog}`,
-      promptSnippet: "Run Worktrunk commands using the installed command, option, and example reference",
+      description: `Run Worktrunk commands. Before using a command's arguments or options, look up its reference by adding --help to its args: {"command":"<command>","args":["--help"]}, or for a subcommand {"command":"<command>","args":["<subcommand>","--help"]}. Help calls return the reference immediately, also as structured data. The command's remaining arguments pass directly to wt without shell expansion. Pi follows Worktrunk's directory-change directive, including from aliases and foreground hooks. If its working directory is gone, Pi recovers to a verified surviving worktree without running the requested command; re-evaluate the command there before retrying. Calls must be sequential: issue one Worktrunk call, wait for its result, then issue the next; a call made while another is still pending fails. Inspection commands return structured results immediately. In TUI/RPC, other commands return status queued and run after this turn. In codemode, end the script immediately on queued or stopped; do not run dependent tools until the continuation arrives. Command failures return status failed with diagnostics, not a thrown exception.${versionNotice}${referenceCatalog}${aliasCatalog}`,
+      promptSnippet: "Run Worktrunk commands; add --help to args to look up a command's reference",
       promptGuidelines: [
-        "Use worktrunk for Worktrunk commands. Select a command and its remaining arguments from the worktrunk reference and examples.",
+        "Use worktrunk for Worktrunk commands. Look up a command's arguments and options by adding --help to its args before using them.",
         "The worktrunk tool follows Worktrunk's requested directory automatically.",
         "In codemode, inspect worktrunk's status. End the script immediately on queued or stopped; queued commands have not run yet. Check failed before using results. Never run Worktrunk calls in parallel.",
         "Never pass -y/--yes to worktrunk; approving project commands is the user's decision, and Pi asks the user when Worktrunk needs approval.",
@@ -1589,6 +1534,16 @@ export default function extension(
             ctx.abort();
             return toolReply("stopped", args, ctx.cwd,
               `Command not run: Pi's working directory is no longer usable. Restart Pi in ${target?.path ?? "a surviving worktree"}.`);
+          }
+          const help = aliasNames.has(params.command) ? undefined : helpRequest(invocation);
+          if (usable && help) {
+            try {
+              const reference = await commandHelp(help, ctx.cwd, signal);
+              return toolReply("completed", args, ctx.cwd, formatCommandHelp(reference), { code: 0 }, reference);
+            } catch (error) {
+              signal?.throwIfAborted();
+              return toolReply("failed", args, ctx.cwd, error instanceof Error ? error.message : String(error), { code: -1 });
+            }
           }
           if (ctx.mode === "print" || ctx.mode === "json" || (usable && canRunInline(invocation, aliasNames.has(params.command)))) {
             let result: WtResult;
