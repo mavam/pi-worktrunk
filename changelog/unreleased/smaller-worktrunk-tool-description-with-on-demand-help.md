@@ -3,6 +3,8 @@ title: Smaller worktrunk tool description with on-demand help
 type: change
 authors:
   - mavam
+prs:
+  - 29
 created: 2026-10-23T06:24:16.904254Z
 ---
 
