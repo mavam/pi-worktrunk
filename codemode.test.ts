@@ -223,8 +223,8 @@ async function runScript(code: string, invoke: Invoke) {
         (pi) => extension({ ...pi,
           sendUserMessage(text: string) { sent.push(text); },
           async exec(program: string, args: string[]) {
-            if (program === "git") return { code: 0, stdout: args.includes("--is-inside-work-tree") ? "true\n" : common, stderr: "", killed: false };
-            return { code: 1, stdout: "", stderr: "", killed: false };
+            if (program === "git") return { code: 0, stdout: args.includes("--is-inside-work-tree") ? "true\n" : common, stderr: "", killed: false, truncated: false };
+            return { code: 1, stdout: "", stderr: "", killed: false, truncated: false };
           },
         }, invoke),
         (pi) => pi.registerTool({

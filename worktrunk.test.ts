@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 
-import { fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall, validateToolArguments } from "@earendil-works/pi-ai";
 import { createAgentSession, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
 
 import registerExtension, {
@@ -305,6 +305,15 @@ test("tool registers synchronously before repository-specific discovery", async 
   assert.deepEqual(tool.parameters.properties.command.enum, [
     "switch", "doctor", "land", "deploy",
   ]);
+  const validate = (args: Parameters<typeof validateToolArguments>[1]["arguments"]) => validateToolArguments(tool, {
+    type: "toolCall", id: "validation", name: tool.name, arguments: args,
+  });
+  for (const command of ["switch", "land"]) {
+    assert.deepEqual(validate({ command, args: ["--help"] }), { command, args: ["--help"] });
+  }
+  assert.deepEqual(validate({ command: "doctor", args: "--help" }), { command: "doctor", args: ["--help"] });
+  assert.throws(() => validate({ command: "unknown-command" }), /command/);
+  assert.throws(() => validate({ args: [] }), /command/);
   assert.match(tool.parameters.properties.args.description, /Arguments after the Worktrunk command/);
   assert.match(tool.description, /## Commands\n- `switch`: Switch worktrees\n- `doctor`: Diagnose setup/);
   assert.doesNotMatch(tool.description, /--create/);
@@ -663,7 +672,7 @@ test("model help runs inline, returns structured data, and is cached", async () 
     assert.deepEqual(result.structuredContent.data.command, ["switch"]);
     assert.deepEqual(result.structuredContent.data.examples[0], { command: "switch", args: ["--create", "new-feature"] });
     assert.match(result.content[0].text, /## Options\n- `-c, --create`: Create a new branch/);
-    assert.notDeepEqual(tool.renderResult(result, {}, { fg: (_: string, text: string) => text, bold: (text: string) => text }, { isError: false }).render(100), []);
+    assert.notDeepEqual(tool.renderResult(result, {}, { fg: (_: string, text: string) => text, bold: (text: string) => text }, { isError: false, keyText: () => "alt+e" }).render(100), []);
     await tool.execute("again", { command: "switch", args: ["-h"] }, undefined, undefined, context);
     assert.equal(calls.filter((call) => call === "switch --help-md").length, 1);
     assert.deepEqual(sent, []);

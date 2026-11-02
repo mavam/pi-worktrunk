@@ -9,6 +9,12 @@ import extension from "./worktrunk.ts";
 import { recordWidgets } from "./widget-recorder.ts";
 
 const entryType = "pi-worktrunk-command-result";
+const keybindings = {
+  keyText(action: string) {
+    assert.equal(action, "app.tools.expand");
+    return "alt+e";
+  },
+};
 
 for (const scenario of ["success", "empty", "failure", "killed", "throw", "move", "model", "json", "large"] as const) {
   test(`slash command display: ${scenario}`, async () => {
@@ -103,19 +109,19 @@ for (const scenario of ["success", "empty", "failure", "killed", "throw", "move"
         bold(text: string) { return text; },
         bg(color: string, text: string) { backgrounds.push(color); return text; },
       };
-      const card = renderers.get(entryType)(entries[0], { expanded: false }, theme);
+      const card = renderers.get(entryType)(entries[0], { expanded: false, ...keybindings }, theme);
       const expected = new Box(1, 1);
       expected.addChild(tools.get("worktrunk").renderCall({ command: "land" }, theme));
       expected.addChild(tools.get("worktrunk").renderResult({
         content: [{ type: "text", text: entries[0].data.output }], details: { code: 0 },
-      }, {}, theme, { isError: entries[0].data.isError }));
+      }, {}, theme, { isError: entries[0].data.isError, ...keybindings }));
       assert.deepEqual(card.render(80), expected.render(80));
       const collapsed = card.render(80).join("\n");
       assert.match(collapsed, entries[0].data.isError ? /Failed/ : /Done/);
       if (entries[0].data.output) {
-        assert.match(collapsed, /to expand/);
+        assert.match(collapsed, /alt\+e to expand/);
         assert.ok(!collapsed.includes(entries[0].data.output.slice(0, 40)));
-        const expanded = renderers.get(entryType)(entries[0], { expanded: true }, theme);
+        const expanded = renderers.get(entryType)(entries[0], { expanded: true, ...keybindings }, theme);
         const expandedExpected = new Box(1, 1);
         expandedExpected.addChild(tools.get("worktrunk").renderCall({ command: "land" }, theme));
         expandedExpected.addChild(new Text(entries[0].data.output, 0, 0));
@@ -130,7 +136,7 @@ for (const scenario of ["success", "empty", "failure", "killed", "throw", "move"
         const copied = destination.getEntries().find((entry) => entry.type === "custom" && entry.customType === entryType);
         assert.ok(copied && copied.type === "custom");
         assert.deepEqual(copied.data, entries[0].data);
-        assert.deepEqual(renderers.get(entryType)(copied, {}, theme).render(80), card.render(80));
+        assert.deepEqual(renderers.get(entryType)(copied, { ...keybindings }, theme).render(80), card.render(80));
       }
     } finally { await rm(root, { recursive: true, force: true }); }
   });

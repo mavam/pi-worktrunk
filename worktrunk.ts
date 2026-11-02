@@ -8,11 +8,11 @@ import { pathToFileURL } from "node:url";
 
 import {
   SessionManager,
-  keyText,
   type AgentToolResult,
   type ExtensionAPI,
   type ExtensionCommandContext,
   type ExtensionContext,
+  type KeybindingHints,
   type SessionEntry,
   type SessionHeader,
   type Theme,
@@ -888,10 +888,10 @@ function renderWorktrunkCall(args: string[], theme: Theme): Text {
   return new Text(text, 0, 0);
 }
 
-function renderWorktrunkOutput(output: string, expanded: boolean, isError: boolean, theme: Theme): Text {
+function renderWorktrunkOutput(output: string, expanded: boolean, isError: boolean, theme: Theme, context: Pick<KeybindingHints, "keyText">): Text {
   if (expanded && output) return new Text(output, 0, 0);
   let text = theme.fg(isError ? "error" : "success", isError ? "Failed" : "Done");
-  if (output) text += theme.fg("dim", ` (${keyText("app.tools.expand")} to expand)`);
+  if (output) text += theme.fg("dim", ` (${context.keyText("app.tools.expand")} to expand)`);
   return new Text(text, 0, 0);
 }
 
@@ -935,12 +935,12 @@ export default function extension(
   invoke: RunWt = runDirectedWt,
   terminal = createTerminalCwdReporter(),
 ) {
-  pi.registerEntryRenderer<CommandDisplay>(COMMAND_ENTRY_TYPE, (entry, { expanded }, theme) => {
+  pi.registerEntryRenderer<CommandDisplay>(COMMAND_ENTRY_TYPE, (entry, options, theme) => {
     if (!entry.data) return undefined;
     const { args, output, isError } = entry.data;
     const box = new Box(1, 1, (text) => theme.bg(isError ? "toolErrorBg" : "toolSuccessBg", text));
     box.addChild(renderWorktrunkCall(args, theme));
-    box.addChild(renderWorktrunkOutput(output, expanded, isError, theme));
+    box.addChild(renderWorktrunkOutput(output, options.expanded, isError, theme, options));
     return box;
   });
   const renderTransition: Parameters<ExtensionAPI["registerMessageRenderer"]>[1] =
@@ -1476,10 +1476,11 @@ export default function extension(
       ? ` Catalog generated from installed ${installedVersion}.`
       : "";
     const referenceCatalog = worktrunkCatalog ? `\n\n${worktrunkCatalog}` : "";
+    // The published StringEnum returns JSON Schema; retain TypeBox's static string type.
     const commandSchema = commandChoices.length
-      ? StringEnum(commandChoices, {
+      ? Type.Unsafe<string>(StringEnum(commandChoices, {
         description: "Built-in Worktrunk command or configured alias to run.",
-      })
+      }))
       : Type.String({ description: "Worktrunk command or configured alias to run." });
     pi.registerTool({
       name: "worktrunk",
@@ -1620,7 +1621,7 @@ export default function extension(
         const details = result.details as { code?: unknown } | undefined;
         if (!context.isError && details?.code === undefined) return new Text("", 0, 0);
         const text = result.content.find((item) => item.type === "text")?.text ?? "";
-        return renderWorktrunkOutput(text, expanded, context.isError, theme);
+        return renderWorktrunkOutput(text, expanded, context.isError, theme, context);
       },
     });
   }
