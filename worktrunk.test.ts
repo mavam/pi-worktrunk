@@ -64,6 +64,7 @@ $ wt -v switch pr:123
 \`\`\`
 `;
 
+const locationArgs = ["--config-set", "list.timeout-ms=1", "--config-set", "list.full=false", "--config-set", "list.json-schema=2", "list", "--format=json"];
 const list = (items: unknown[]) => JSON.stringify({ schema: 2, items });
 const wtList = (source: string, target?: string) => list([
   { branch: "main", worktree: { path: source, main: true, current: true } },
@@ -460,7 +461,7 @@ test("non-interactive tools run Worktrunk before the session exits", async () =>
   } finally {
     await rm(removedCwd, { recursive: true, force: true });
   }
-  assert.deepEqual(calls, [["--config-set", "list.json-schema=2", "list", "--format=json"], ["list"], ["step", "promote", "feature"], ["list"], ["step", "promote", "feature"], ["switch", "--no-cd", "feature"], ["list", "--large"], ["remove", "current"]]);
+  assert.deepEqual(calls, [locationArgs, ["list"], ["step", "promote", "feature"], ["list"], ["step", "promote", "feature"], ["switch", "--no-cd", "feature"], ["list", "--large"], ["remove", "current"]]);
   assert.deepEqual(sent, []);
 });
 
@@ -543,6 +544,8 @@ test("Worktrunk client reads lists and reports failures", async () => {
   const items = await client.list("/repo");
   assert.equal(items[0].worktree?.current, true);
   assert.deepEqual(calls[0], ["--config-set", "list.json-schema=2", "list", "--format=json"]);
+  await client.list("/repo", undefined, false);
+  assert.deepEqual(calls[1], locationArgs);
 
   const failing = createWorktrunkClient(async () => ({ code: 1, stderr: "needs approval" }));
   await assert.rejects(failing.list(process.cwd()), /wt list failed: needs approval.*approvals add/s);
@@ -608,6 +611,34 @@ test("create-and-switch moves and resumes model work", async () => {
     }
     assert.equal(continuation.message.display, false);
     assert.equal(continuation.opts.triggerTurn, true);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("switch picker loads full status", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-worktrunk-picker-"));
+  const source = join(root, "repo");
+  await mkdir(join(source, ".git"), { recursive: true });
+  const handlers = new Map<string, any>();
+  const commands = new Map<string, any>();
+  const tools = new Map<string, any>();
+  const lists: string[][] = [];
+  let options: string[] = [];
+  try {
+    extension(baseApi({ handlers, commands, tools, async exec(program, args) {
+      if (program === "git") return { code: 0, stdout: `${join(source, ".git")}\n` };
+      if (!args.includes("list")) return { code: 0, stdout: "" };
+      lists.push(args);
+      const display = args.includes("list.timeout-ms=1") ? undefined : { symbols: "^" };
+      return { code: 0, stdout: list([{ branch: "main", worktree: { path: source, main: true, current: true }, display }]) };
+    } }));
+    const manager = SessionManager.create(source, join(root, "sessions"));
+    await handlers.get("session_start")({}, { cwd: source, sessionManager: manager });
+    await commands.get("wt").handler("switch", {
+      cwd: source, mode: "tui", hasUI: true, sessionManager: manager, async waitForIdle() {},
+      ui: { notify() {}, setWidget() {}, async select(_title: string, items: string[]) { options = items; } },
+    });
+    assert.deepEqual(lists, [locationArgs, locationArgs, ["--config-set", "list.json-schema=2", "list", "--format=json"]]);
+    assert.deepEqual(options, ["main [current, main] ^"]);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
