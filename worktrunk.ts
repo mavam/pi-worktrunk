@@ -322,9 +322,11 @@ function formatWtFailure(args: readonly string[], result: WtResult, cwd: string)
 
 export function createWorktrunkClient(runWt: RunWt) {
   return {
-    async list(cwd: string, signal?: AbortSignal): Promise<WorktreeItem[]> {
+    /** Without status, only path, branch, and current/main, which Worktrunk fills in before its slow status work. */
+    async list(cwd: string, signal?: AbortSignal, status = true): Promise<WorktreeItem[]> {
+      const budget = status ? [] : ["--config-set", "list.timeout-ms=1", "--config-set", "list.full=false"];
       const result = await runWt(
-        ["--config-set", "list.json-schema=2", "list", "--format=json"],
+        [...budget, "--config-set", "list.json-schema=2", "list", "--format=json"],
         { cwd, signal },
       );
       if (result.code !== 0) throw new WorktrunkError(formatWtFailure(["list"], result, cwd));
@@ -1003,7 +1005,7 @@ export default function extension(
   const tracker = createMarkerUpdater(execWt);
 
   async function safeList(cwd: string, signal?: AbortSignal): Promise<WorktreeItem[]> {
-    try { return await client.list(cwd, signal); } catch { return []; }
+    try { return await client.list(cwd, signal, false); } catch { return []; }
   }
   async function readWorktreeIdentity(cwd: string): Promise<RepositoryIdentity | undefined> {
     try {
@@ -1294,8 +1296,10 @@ export default function extension(
     const source: SessionLocation = { branch: sourceItem?.branch ?? null, path: ctx.cwd, commonDir };
     let args = invocation.args;
     if (!modelOrigin && isBareCommand(invocation, "switch") && interactive && ctx.hasUI) {
+      progress.show("Loading worktrees");
+      const worktrees = await client.list(ctx.cwd, ctx.signal);
       progress.hide();
-      const selected = await chooseWorktree(ctx, "Select a worktree", before.filter((item) => item.worktree?.path));
+      const selected = await chooseWorktree(ctx, "Select a worktree", worktrees.filter((item) => item.worktree?.path));
       if (!selected?.worktree?.path) {
         return { result: { code: 0 }, output: "", moved: false, canContinue: true };
       }
