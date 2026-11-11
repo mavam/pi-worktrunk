@@ -1,0 +1,9 @@
+created: 2026-11-11
+title: Faster startup and tool calls in large repositories
+intro: >-
+  Pi starts faster in large repositories, and Worktrunk tools no longer wait for status
+  when they only need worktree locations. `/wt list` and the `/wt switch` picker continue
+  to show full status.
+source:
+  mode: sync-stable-queue
+  previous_stable: v0.13.1
